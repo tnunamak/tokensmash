@@ -998,18 +998,20 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
         markdown_table(
             [
                 "tool",
+                "how applied",
                 "baseline tokens",
                 "tool tokens",
-                "improvement",
+                "token result",
                 "model",
                 "reasoning",
                 "task",
                 "oracle",
-                "result",
+                "oracle result",
             ],
             [
                 [
                     row["tool"],
+                    row["tool_label"],
                     str(row["baseline_tokens"]),
                     str(row["tool_tokens"]),
                     pct_improvement(row["baseline_tokens"], row["tool_tokens"]),

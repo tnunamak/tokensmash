@@ -10,18 +10,34 @@ The primary metric is provider-reported session tokens, not a tool's self-report
 
 Reference smoke run, 2026-06-11:
 
-| tool         | baseline tokens | tool tokens | improvement | model   | reasoning | task class                 | oracle        | result |
-| ------------ | --------------- | ----------- | ----------- | ------- | --------- | -------------------------- | ------------- | ------ |
-| context_mode | 1265375         | 643229      | +49.2%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
-| headroom     | 1265375         | 591837      | +53.2%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
-| rtk          | 1265375         | 696266      | +45.0%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
-| semmap       | 999151          | 879352      | +12.0%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
-| repomix      | 620319          | 1309307     | -111.1%     | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
-| gitingest    | 620319          | 949669      | -53.1%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+| tool | how it was applied | baseline tokens | tool tokens | token result | model | reasoning | oracle result |
+| --- | --- | ---: | ---: | ---: | --- | --- | --- |
+| [context-mode](https://github.com/mksglu/context-mode) | enabled as a Codex MCP server with Codex lifecycle hooks in an isolated `CODEX_HOME` | 1265375 | 643229 | +49.2% | gpt-5.5 | low | pass |
+| [Headroom](https://github.com/chopratejas/headroom) | exposed as a Codex MCP server and prompted as optional context compression | 1265375 | 591837 | +53.2% | gpt-5.5 | low | pass |
+| [RTK](https://github.com/rtk-ai/rtk) | prompted Codex to prefer `rtk` shell wrappers; not tested as an automatic hook | 1265375 | 696266 | +45.0% | gpt-5.5 | low | pass |
+| [SEMMAP](https://github.com/junovhs/semmap) | generated `SEMMAP.md` before the run and prompted Codex to inspect it before broad search | 999151 | 879352 | +12.0% | gpt-5.5 | low | pass |
+| [Repomix](https://github.com/yamadashy/repomix) | generated a full-repo `repomix.md` pack before the run and exposed its path in the prompt | 620319 | 1309307 | -111.1% | gpt-5.5 | low | pass |
+| [Gitingest](https://github.com/coderamp-labs/gitingest) | generated a full-repo `gitingest.txt` digest before the run and exposed its path in the prompt | 620319 | 949669 | -53.1% | gpt-5.5 | low | pass |
 
-Interpretation: this is a smoke result, not a leaderboard. It is one task, one
-replicate per row, Codex CLI only, and rows came from multiple bounded batches
-with paired baselines per batch.
+Interpretation: `oracle result` only says whether the coding task succeeded.
+`token result` is the benchmark outcome. This is a smoke result, not a
+leaderboard. It is one task, one replicate per row, Codex CLI only, and rows
+came from multiple bounded batches with paired baselines per batch.
+
+## What The Task Was
+
+The reference task was a single maintenance bug fix in a Go application
+repository. The agent had to change code and tests for a CLI/provider path
+detection issue, then pass:
+
+```bash
+go test ./...
+```
+
+That makes this result most relevant to small-to-medium coding tasks in a
+tested repository. It is not evidence for greenfield implementation, large
+refactors, UI work, documentation tasks, research tasks, or long multi-session
+debugging.
 
 ## What It Measures
 
@@ -33,15 +49,35 @@ Default metric:
 total_token_usage.total_tokens per successful task
 ```
 
-## Prior Art
+## Methodology Risks
 
-The repo layout borrows from established evaluation projects:
+The current smoke result is useful, but easy to over-interpret.
 
-- [SWE-bench](https://github.com/swe-bench/SWE-bench): real repository tasks, reproducible evaluation logs, execution-based oracles.
-- [SWE-bench harness docs](https://www.swebench.com/SWE-bench/reference/harness/): isolated evaluation environments.
-- [EleutherAI lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness): config-defined tasks and broad model/task extensibility.
-- [lm-evaluation-harness task guide](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/docs/task_guide.md): task definitions as reusable configuration.
-- [OpenCompass](https://github.com/open-compass/opencompass): model/dataset/config separation and benchmark-card style reporting across many datasets.
+Main critiques:
+
+- **Single task:** one Go maintenance task cannot represent all agent work.
+- **Single replicate:** agent variance can move token totals without any tool
+  being responsible.
+- **Different batches:** rows use paired baselines, but not one shared baseline.
+- **Tool exposure vs tool use:** the Headroom run exposed the MCP server, but
+  the checked session log did not prove Headroom MCP calls were used.
+- **Integration mismatch:** RTK was tested by instruction to use `rtk` shell
+  wrappers, not as a transparent default hook.
+- **Packers are task-sensitive:** full-repo packs can be useful for audit or
+  handoff tasks, but they were inefficient for this focused bug fix.
+- **Oracle is narrow:** `go test ./...` checks task success, not patch quality,
+  maintainability, or user experience.
+
+How to make the benchmark stronger:
+
+- Run 20-50 public tasks across languages and repo sizes.
+- Run 3-5 replicates per tool and report median, range, and confidence
+  intervals.
+- Randomize run order to reduce time/rate-limit/cache effects.
+- Record actual tool-use evidence per row, not just tool availability.
+- Test each tool in the way users would actually enable it by default.
+- Publish task manifests, base refs, prompts, oracle commands, patch hashes, and
+  sanitized token summaries.
 
 ## Repo Structure
 
@@ -78,19 +114,14 @@ uv run tokensmash report ~/.local/state/tokensmash/ab-runs/my-project-context-mo
 
 `run` is dry-run by default. Add `--live` only when intentionally spending model quota.
 
-## Built-In Variants
+## Built-In Tool Conditions
 
-The generic suite includes these tool conditions:
+The generic suite includes baseline plus context-mode, Headroom, RTK, SEMMAP,
+Repomix, and Gitingest. Variants skip cleanly when required environment
+variables or commands are missing.
 
-- `baseline_no_user_config`
-- `context_mode`
-- `headroom`
-- `rtk`
-- `semmap`
-- `repomix`
-- `gitingest`
-
-Variants skip cleanly when required environment variables or commands are missing.
+Use the `how it was applied` column above to decide whether the current variant
+matches the way you would expect to use that tool.
 
 ## Auditing Your Own Session Logs
 
