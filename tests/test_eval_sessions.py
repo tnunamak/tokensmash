@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tokensmash.cli import eval_sessions  # noqa: E402
+from tokensmash.cli import comparison_rows, eval_sessions  # noqa: E402
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -80,6 +80,21 @@ class EvalSessionsTest(unittest.TestCase):
                             "output": "Executed 2 commands (40 lines, 4.0KB). Indexed 2 sections.",
                         },
                     },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 900,
+                                    "cached_input_tokens": 300,
+                                    "output_tokens": 50,
+                                    "reasoning_output_tokens": 25,
+                                    "total_tokens": 1275,
+                                }
+                            },
+                        },
+                    },
                 ],
             )
             args = argparse.Namespace(
@@ -87,7 +102,8 @@ class EvalSessionsTest(unittest.TestCase):
                 codex_root=str(sessions),
                 repo_root=str(repo),
                 latest=1,
-                session=[],
+                session=[str(sessions)],
+                sample_name="fixture sample",
                 tools="rtk,context-mode,headroom",
                 semmap_bin="semmap",
                 headroom_perf=None,
@@ -98,12 +114,51 @@ class EvalSessionsTest(unittest.TestCase):
             result = eval_sessions(args)
             rows = {row["tool_id"]: row for row in result["rows"]}
 
+            self.assertEqual(result["sample"]["name"], "fixture sample")
+            self.assertEqual(result["sample"]["session_count"], 1)
+            self.assertEqual(result["sample"]["total_tokens"], 1275)
+            self.assertEqual(result["sample"]["cached_input_tokens"], 300)
+            self.assertEqual(result["sample"]["non_cached_tokens"], 975)
             self.assertEqual(rows["rtk"]["sample_count"], 1)
             self.assertEqual(rows["rtk"]["token_pressure_before"], 1000)
             self.assertEqual(rows["context-mode"]["sample_count"], 1)
             self.assertEqual(rows["context-mode"]["token_pressure_before"], 1024)
             self.assertEqual(rows["headroom"]["mechanism_fired"], "no")
             self.assertEqual(rows["headroom"]["future_session_confidence_percent"], 0)
+
+    def test_comparison_rows_include_non_cached_spend(self) -> None:
+        result = {
+            "baseline": "baseline",
+            "runs": [
+                {
+                    "success": True,
+                    "task_id": "task",
+                    "replicate": 1,
+                    "variant_id": "baseline",
+                    "token_total": 1000,
+                    "token_usage": {"total_tokens": 1000, "cached_input_tokens": 700},
+                },
+                {
+                    "success": True,
+                    "task_id": "task",
+                    "replicate": 1,
+                    "variant_id": "rtk",
+                    "token_total": 800,
+                    "token_usage": {"total_tokens": 800, "cached_input_tokens": 650},
+                    "mechanism_checks": {"required": True, "ok": True, "checks": []},
+                },
+            ],
+        }
+
+        rows = comparison_rows(result, "baseline")
+
+        self.assertEqual(rows[0][0], "rtk")
+        self.assertEqual(rows[0][1], "1,000")
+        self.assertEqual(rows[0][2], "800")
+        self.assertEqual(rows[0][3], "+20.0%")
+        self.assertEqual(rows[0][4], "300")
+        self.assertEqual(rows[0][5], "150")
+        self.assertEqual(rows[0][6], "+50.0%")
 
 
 if __name__ == "__main__":

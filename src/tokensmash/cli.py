@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import glob
 import hashlib
 import json
 import os
@@ -74,8 +75,9 @@ def main() -> int:
     eval_sessions_parser.add_argument("--agent", choices=["codex"], default="codex")
     eval_sessions_parser.add_argument("--codex-root", default=str(CODEX_SESSIONS_DIR))
     eval_sessions_parser.add_argument("--repo-root", default=str(Path.cwd()), help="Repository root for artifact-tool evaluation.")
+    eval_sessions_parser.add_argument("--sample-name", default="", help="Human label for this arbitrary session sample.")
     eval_sessions_parser.add_argument("--latest", type=int, default=5, help="Number of recent Codex sessions to evaluate.")
-    eval_sessions_parser.add_argument("--session", action="append", default=[], help="Specific Codex JSONL session path.")
+    eval_sessions_parser.add_argument("--session", action="append", default=[], help="Codex JSONL file, directory, glob, or @manifest path; repeatable.")
     eval_sessions_parser.add_argument(
         "--tools",
         default="rtk,context-mode,semmap,repomix,gitingest,headroom",
@@ -1374,10 +1376,11 @@ def eval_sessions(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path(args.repo_root).expanduser().resolve()
     session_paths = selected_codex_eval_session_files(
         Path(args.codex_root).expanduser(),
-        [Path(path).expanduser() for path in args.session],
+        list(args.session or []),
         args.latest,
     )
     sessions, pressure_events, file_refs = extract_codex_eval_pressure(session_paths, repo_root)
+    sample = sample_summary(sessions, args.sample_name)
     artifact_rows = [] if args.no_artifacts else eval_artifact_tools(tools, repo_root, file_refs, args.semmap_bin)
     headroom_row = eval_headroom_perf(Path(args.headroom_perf).expanduser()) if args.headroom_perf else None
     rows = []
@@ -1398,6 +1401,7 @@ def eval_sessions(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "agent": "codex",
         "repo_root": str(repo_root),
+        "sample": sample,
         "session_count": len(sessions),
         "sessions": sessions,
         "rows": rows,
@@ -1422,16 +1426,16 @@ def selected_eval_tools(value: str) -> list[str]:
     return requested or list(EVAL_TOOL_ORDER)
 
 
-def selected_codex_eval_session_files(root: Path, explicit: list[Path], latest: int) -> list[Path]:
+def selected_codex_eval_session_files(root: Path, explicit: list[str], latest: int) -> list[Path]:
     selected: list[Path] = []
     seen: set[str] = set()
-    for path in explicit:
-        if not path.exists() or not path.is_file():
-            continue
+    for path in resolve_session_inputs(explicit):
         key = str(path.resolve())
         if key not in seen:
             selected.append(path)
             seen.add(key)
+    if selected:
+        return selected
     remaining = max(0, int(latest or 0) - len(selected))
     if remaining and root.exists():
         candidates = recent_session_files(root, cutoff=0, limit=max(remaining * 20, remaining))
@@ -1444,6 +1448,49 @@ def selected_codex_eval_session_files(root: Path, explicit: list[Path], latest: 
             if len(selected) >= int(latest or 0):
                 break
     return selected
+
+
+def resolve_session_inputs(inputs: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for raw in inputs:
+        value = str(raw).strip()
+        if not value:
+            continue
+        if value.startswith("@"):
+            paths.extend(resolve_session_manifest(Path(value[1:]).expanduser()))
+            continue
+        expanded = glob.glob(os.path.expanduser(value))
+        if expanded:
+            for match in expanded:
+                paths.extend(resolve_session_path(Path(match).expanduser()))
+            continue
+        paths.extend(resolve_session_path(Path(value).expanduser()))
+    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return paths
+
+
+def resolve_session_manifest(path: Path) -> list[Path]:
+    try:
+        values = [line.strip() for line in path.read_text().splitlines()]
+    except OSError:
+        return []
+    entries = []
+    for value in values:
+        if not value or value.startswith("#"):
+            continue
+        entry = Path(value).expanduser()
+        entries.append(str(entry if entry.is_absolute() else path.parent / entry))
+    return resolve_session_inputs(entries)
+
+
+def resolve_session_path(path: Path) -> list[Path]:
+    if not path.exists():
+        return []
+    if path.is_file() and path.suffix in {".jsonl", ".json"}:
+        return [path]
+    if path.is_dir():
+        return recent_session_files(path, cutoff=0, limit=1_000_000)
+    return []
 
 
 def extract_codex_eval_pressure(
@@ -1505,6 +1552,7 @@ def extract_one_codex_eval_session(path: Path, repo_root: Path) -> tuple[dict[st
                 events.append(event)
                 file_refs.update(repo_relative_paths_from_text(str(call.get("command") or ""), repo_root))
                 file_refs.update(repo_relative_paths_from_text(output[:20000], repo_root))
+    usage = normalize_codex_token_usage(token_usage)
     stats = {
         "source_file_sha256": sha_text(str(path)),
         "source_file_mtime": dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat(),
@@ -1512,10 +1560,36 @@ def extract_one_codex_eval_session(path: Path, repo_root: Path) -> tuple[dict[st
         "event_count": event_count,
         "tool_calls": tool_calls,
         "tool_output_bytes": tool_output_bytes,
-        "total_tokens": normalize_total_tokens(token_usage),
+        "input_tokens": usage["input_tokens"],
+        "cached_input_tokens": usage["cached_input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "reasoning_output_tokens": usage["reasoning_output_tokens"],
+        "total_tokens": usage["total_tokens"],
+        "non_cached_tokens": usage["non_cached_tokens"],
         "pressure_events": len(events),
     }
     return stats, events, file_refs
+
+
+def sample_summary(sessions: list[dict[str, Any]], sample_name: str) -> dict[str, Any]:
+    total = sum(int(session.get("total_tokens") or 0) for session in sessions)
+    cached = sum(int(session.get("cached_input_tokens") or 0) for session in sessions)
+    input_tokens = sum(int(session.get("input_tokens") or 0) for session in sessions)
+    output = sum(int(session.get("output_tokens") or 0) for session in sessions)
+    reasoning = sum(int(session.get("reasoning_output_tokens") or 0) for session in sessions)
+    non_cached = sum(int(session.get("non_cached_tokens") or 0) for session in sessions)
+    name = sample_name or ("supplied sessions" if sessions else "empty sample")
+    return {
+        "name": name,
+        "session_count": len(sessions),
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached,
+        "output_tokens": output,
+        "reasoning_output_tokens": reasoning,
+        "total_tokens": total,
+        "non_cached_tokens": non_cached,
+        "cached_share_percent": round(cached / total * 100, 1) if total else None,
+    }
 
 
 def codex_call_info(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1642,17 +1716,25 @@ def approximate_text_tokens(text: str) -> int:
     return max(1, round(len(text) / 4)) if text else 0
 
 
-def normalize_total_tokens(usage: dict[str, Any]) -> int:
-    return int(
+def normalize_codex_token_usage(usage: dict[str, Any]) -> dict[str, int]:
+    input_tokens = int(usage.get("input_tokens") or usage.get("promptTokenCount") or 0)
+    cached_input_tokens = int(usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("candidatesTokenCount") or 0)
+    reasoning_output_tokens = int(usage.get("reasoning_output_tokens") or 0)
+    total_tokens = int(
         usage.get("total_tokens")
         or usage.get("totalTokenCount")
-        or (
-            int(usage.get("input_tokens") or 0)
-            + int(usage.get("cached_input_tokens") or 0)
-            + int(usage.get("output_tokens") or 0)
-            + int(usage.get("reasoning_output_tokens") or 0)
-        )
+        or (input_tokens + cached_input_tokens + output_tokens + reasoning_output_tokens)
     )
+    non_cached_tokens = max(0, total_tokens - cached_input_tokens)
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "total_tokens": total_tokens,
+        "non_cached_tokens": non_cached_tokens,
+    }
 
 
 def repo_relative_paths_from_text(text: str, repo_root: Path) -> set[str]:
@@ -1997,7 +2079,12 @@ def base_eval_row(tool_id: str) -> dict[str, Any]:
         "evaluated_on_real_session": "no",
         "token_pressure_before": None,
         "token_spend_with_tool": None,
+        "cached_tokens_before": None,
+        "cached_tokens_with_tool": None,
+        "non_cached_tokens_before": None,
+        "non_cached_tokens_with_tool": None,
         "percent_improvement": None,
+        "non_cached_percent_improvement": None,
         "future_session_confidence_percent": 0,
         "sample_count": 0,
         "verdict": "not evaluated",
@@ -2029,6 +2116,20 @@ def pct_reduction(before: int | float, after: int | float) -> float:
 
 
 def print_eval_sessions_table(result: dict[str, Any]) -> None:
+    sample = result.get("sample") if isinstance(result.get("sample"), dict) else {}
+    if sample:
+        cached_share = sample.get("cached_share_percent")
+        share = "n/a" if cached_share is None else f"{float(cached_share):.1f}%"
+        print(
+            "sample: "
+            f"{sample.get('name') or 'supplied sessions'}; "
+            f"sessions {int(sample.get('session_count') or 0):,}; "
+            f"total {format_int_cell(sample.get('total_tokens'))}; "
+            f"cached {format_int_cell(sample.get('cached_input_tokens'))}; "
+            f"non-cached {format_int_cell(sample.get('non_cached_tokens'))}; "
+            f"cached share {share}"
+        )
+        print()
     headers = [
         "tool",
         "mechanism fired?",
@@ -2130,9 +2231,12 @@ def print_table(results: dict[str, Any]) -> None:
     rows = comparison_rows(results, baseline_id)
     headers = [
         "tool",
-        "baseline token spend",
-        "token spend with tool",
-        "percent improvement",
+        "baseline total",
+        "tool total",
+        "total improvement",
+        "baseline non-cached",
+        "tool non-cached",
+        "non-cached improvement",
         "confidence",
         "mechanism",
     ]
@@ -2163,6 +2267,9 @@ def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]
             continue
         base_total = 0
         tool_total = 0
+        base_non_cached_total = 0
+        tool_non_cached_total = 0
+        non_cached_pairs = 0
         measured_pairs = 0
         invalid_pairs = 0
         for by_variant in grouped.values():
@@ -2179,18 +2286,27 @@ def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]
                 continue
             base_total += int(base_tokens)
             tool_total += int(tool_tokens)
+            base_non_cached = run_non_cached_tokens(base)
+            tool_non_cached = run_non_cached_tokens(tool)
+            if base_non_cached is not None and tool_non_cached is not None:
+                base_non_cached_total += base_non_cached
+                tool_non_cached_total += tool_non_cached
+                non_cached_pairs += 1
             measured_pairs += 1
         if measured_pairs == 0 and invalid_pairs == 0:
-            rows.append([variant_id, "n/a", "n/a", "n/a", "none", "not observed"])
+            rows.append([variant_id, "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "none", "not observed"])
         elif measured_pairs == 0:
-            rows.append([variant_id, "not reported", "not reported", "not measured", "none", "not observed"])
+            rows.append([variant_id, "not reported", "not reported", "not measured", "n/a", "n/a", "n/a", "none", "not observed"])
         elif invalid_pairs:
             rows.append(
                 [
                     variant_id,
-                    str(base_total),
-                    str(tool_total),
+                    format_int_cell(base_total),
+                    format_int_cell(tool_total),
                     pct_improvement(base_total, tool_total),
+                    format_int_cell(base_non_cached_total) if non_cached_pairs else "n/a",
+                    format_int_cell(tool_non_cached_total) if non_cached_pairs else "n/a",
+                    pct_improvement(base_non_cached_total, tool_non_cached_total) if non_cached_pairs else "n/a",
                     actionable_confidence(base_total, tool_total, measured_pairs, invalid_pairs),
                     "partially observed",
                 ]
@@ -2199,14 +2315,30 @@ def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]
             rows.append(
                 [
                     variant_id,
-                    str(base_total),
-                    str(tool_total),
+                    format_int_cell(base_total),
+                    format_int_cell(tool_total),
                     pct_improvement(base_total, tool_total),
+                    format_int_cell(base_non_cached_total) if non_cached_pairs else "n/a",
+                    format_int_cell(tool_non_cached_total) if non_cached_pairs else "n/a",
+                    pct_improvement(base_non_cached_total, tool_non_cached_total) if non_cached_pairs else "n/a",
                     actionable_confidence(base_total, tool_total, measured_pairs, invalid_pairs),
                     "observed",
                 ]
             )
-    return rows or [["no comparable tool rows", "n/a", "n/a", "n/a", "none", "n/a"]]
+    return rows or [["no comparable tool rows", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "none", "n/a"]]
+
+
+def run_non_cached_tokens(run: dict[str, Any]) -> int | None:
+    usage = run.get("token_usage")
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("total_tokens")
+    cached = usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens") or 0
+    if total is None:
+        total = run.get("token_total")
+    if total is None:
+        return None
+    return max(0, int(total) - int(cached or 0))
 
 
 def mechanism_observed(run: dict[str, Any], baseline_id: str) -> bool:
@@ -2241,7 +2373,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
         "",
         "## Summary",
         "",
-        "Primary metric: provider-reported total session tokens per successful task run.",
+        "Primary metric: paired session-token spend per successful task run, with total and non-cached tokens separated.",
         "Each row uses the paired baseline from the same result batch, task, and replicate.",
         "",
         markdown_table(
@@ -2249,9 +2381,12 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                 "tool",
                 "how applied",
                 "agent",
-                "baseline tokens",
-                "tool tokens",
-                "token result",
+                "baseline total",
+                "tool total",
+                "total result",
+                "baseline non-cached",
+                "tool non-cached",
+                "non-cached result",
                 "confidence",
                 "mechanism",
                 "model",
@@ -2268,6 +2403,9 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                     row["baseline_tokens_display"],
                     row["tool_tokens_display"],
                     row["token_result"],
+                    row["baseline_non_cached_display"],
+                    row["tool_non_cached_display"],
+                    row["non_cached_result"],
                     row["confidence"],
                     row["mechanism"],
                     row["model"],
@@ -2361,6 +2499,8 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
             observed = mechanism_observed(run, baseline_id)
             baseline_tokens = int(baseline.get("token_total") or 0)
             tool_tokens = int(run.get("token_total") or 0)
+            baseline_non_cached = run_non_cached_tokens(baseline)
+            tool_non_cached = run_non_cached_tokens(run)
             confidence = actionable_confidence(baseline_tokens, tool_tokens, 1 if observed else 0, 0 if observed else 1)
             rows.append(
                 {
@@ -2371,6 +2511,13 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "baseline_tokens_display": str(baseline_tokens) if observed else "not reported",
                     "tool_tokens_display": str(tool_tokens) if observed else "not reported",
                     "token_result": pct_improvement(baseline_tokens, tool_tokens) if observed else "not measured",
+                    "baseline_non_cached": baseline_non_cached,
+                    "tool_non_cached": tool_non_cached,
+                    "baseline_non_cached_display": format_int_cell(baseline_non_cached) if observed else "not reported",
+                    "tool_non_cached_display": format_int_cell(tool_non_cached) if observed else "not reported",
+                    "non_cached_result": pct_improvement(baseline_non_cached, tool_non_cached)
+                    if observed and baseline_non_cached is not None and tool_non_cached is not None
+                    else "n/a",
                     "confidence": confidence if observed else "none",
                     "mechanism": mechanism_summary(run, baseline_id),
                     "mechanism_ok": observed,
