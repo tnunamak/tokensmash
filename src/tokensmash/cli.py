@@ -13,6 +13,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -28,6 +29,11 @@ CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SUITE = Path(__file__).resolve().parent / "data" / "suites" / "generic" / "tool-comparison.json"
+GPT55_SHORT_CONTEXT_PRICES = {
+    "fresh_input_per_m": 2.50,
+    "cached_input_per_m": 0.25,
+    "output_per_m": 15.00,
+}
 
 
 def main() -> int:
@@ -51,12 +57,15 @@ def main() -> int:
     run.add_argument("--timeout", type=float, help="Per agent run timeout seconds.")
     run.add_argument("--live", action="store_true", help="Actually spend model quota.")
     run.add_argument("--keep-scratch", action="store_true")
+    run.add_argument("--randomize-order", action="store_true", help="Shuffle task/variant execution order.")
+    run.add_argument("--seed", type=int, default=0, help="Seed for --randomize-order.")
 
     table = sub.add_parser("table", help="Print baseline/tool/improvement table.")
     table.add_argument("results", help="Run directory or results.json.")
 
     aggregate = sub.add_parser("aggregate", help="Aggregate comparable tool rows across result files.")
     aggregate.add_argument("results", nargs="+", help="Run directories or results.json files.")
+    aggregate.add_argument("--strict", action="store_true", help="Require methodology audit pass for both paired runs.")
 
     report = sub.add_parser("report", help="Write a benchmark-card Markdown report.")
     report.add_argument("results", nargs="+", help="Run directories or results.json files.")
@@ -117,7 +126,7 @@ def main() -> int:
         return 0
     if args.cmd == "aggregate":
         results = [load_results(resolve_results_path(Path(path))) for path in args.results]
-        print_aggregate_table(results)
+        print_aggregate_table(results, strict=args.strict)
         return 0
     if args.cmd == "report":
         results = [load_results(resolve_results_path(Path(path))) for path in args.results]
@@ -294,25 +303,38 @@ def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.N
         ],
     }
     (run_dir / "suite.json").write_text(json.dumps(scrub_suite(suite), indent=2, sort_keys=True) + "\n")
+    cases: list[tuple[dict[str, Any], dict[str, Any], int]] = []
+    for task in selection["tasks"]:
+        for variant in selection["variants"]:
+            for replicate in range(1, selection["replicates"] + 1):
+                cases.append((task, variant, replicate))
+    if getattr(args, "randomize_order", False):
+        rng = random.Random(int(getattr(args, "seed", 0) or 0))
+        rng.shuffle(cases)
+        results["randomized_order"] = True
+        results["random_seed"] = int(getattr(args, "seed", 0) or 0)
+    else:
+        results["randomized_order"] = False
     try:
-        for task in selection["tasks"]:
-            for variant in selection["variants"]:
-                status, why = variant_status(suite, variant)
-                if status != "enabled":
-                    results["runs"].append(
-                        {
-                            "task_id": task["id"],
-                            "variant_id": variant["id"],
-                            "agent": variant_agent(suite, variant),
-                            "status": status,
-                            "skip_reason": why,
-                        }
-                    )
-                    continue
-                for replicate in range(1, selection["replicates"] + 1):
-                    result = run_one(suite, task, variant, replicate, run_dir, args)
-                    results["runs"].append(result)
-                    write_results(run_dir, results)
+        for run_order, (task, variant, replicate) in enumerate(cases, start=1):
+            status, why = variant_status(suite, variant)
+            if status != "enabled":
+                results["runs"].append(
+                    {
+                        "task_id": task["id"],
+                        "variant_id": variant["id"],
+                        "agent": variant_agent(suite, variant),
+                        "replicate": replicate,
+                        "run_order": run_order,
+                        "status": status,
+                        "skip_reason": why,
+                    }
+                )
+                continue
+            result = run_one(suite, task, variant, replicate, run_dir, args)
+            result["run_order"] = run_order
+            results["runs"].append(result)
+            write_results(run_dir, results)
     finally:
         write_results(run_dir, results)
     return run_dir
@@ -356,6 +378,7 @@ def run_one(
             and all(cmd["exit_code"] == 0 for cmd in result["success_commands"])
         )
         result["status"] = "ok" if result["success"] else "failed"
+        result["methodology_audit"] = audit_run_methodology(result, variant, suite["baseline"])
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
@@ -834,6 +857,55 @@ def run_mechanism_check(
             "min": minimum,
         }
     return {"label": label, "type": typ, "ok": False, "error": f"unknown mechanism check type: {typ}"}
+
+
+def audit_run_methodology(
+    result: dict[str, Any],
+    variant: dict[str, Any],
+    baseline_id: str,
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def add(label: str, ok: bool, detail: str = "") -> None:
+        item: dict[str, Any] = {"label": label, "ok": bool(ok)}
+        if detail:
+            item["detail"] = detail
+        checks.append(item)
+
+    usage = result.get("token_usage")
+    token_total = result.get("token_total")
+    add("agent exited cleanly", result.get("agent_exit_code") == 0)
+    add("agent did not time out", not bool(result.get("agent_timed_out")))
+    add("verification oracle passed", all(cmd.get("exit_code") == 0 for cmd in result.get("success_commands") or []))
+    add("token usage present", isinstance(usage, dict) and token_total is not None)
+    if isinstance(usage, dict) and token_total is not None:
+        total = int(usage.get("total_tokens") or 0)
+        cached = int(usage.get("cached_input_tokens") or 0)
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        add("token total matches usage", int(token_total) == total)
+        add("cached input within input", 0 <= cached <= input_tokens)
+        add("input plus output matches total", input_tokens + output_tokens == total)
+
+    if str(result.get("variant_id")) != baseline_id:
+        add("tool mechanism observed", mechanism_observed(result, baseline_id), mechanism_summary(result, baseline_id))
+
+    case_dir_value = result.get("case_dir")
+    session_path_value = result.get("session_path")
+    if variant.get("isolated_home"):
+        case_dir = Path(str(case_dir_value)).expanduser() if case_dir_value else None
+        session_path = Path(str(session_path_value)).expanduser() if session_path_value else None
+        add("session path present", session_path is not None and bool(str(session_path)))
+        if case_dir and session_path:
+            add(
+                "session path isolated",
+                path_is_relative_to(session_path, case_dir),
+                f"{session_path}",
+            )
+        else:
+            add("session path isolated", False)
+
+    return {"ok": all(item["ok"] for item in checks), "checks": checks}
 
 
 def session_tool_text(path: Path) -> str:
@@ -2239,6 +2311,14 @@ def resolve_results_path(path: Path) -> Path:
     return path
 
 
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def print_table(results: dict[str, Any]) -> None:
     baseline_id = str(results["baseline"])
     rows = comparison_rows(results, baseline_id)
@@ -2260,7 +2340,7 @@ def print_table(results: dict[str, Any]) -> None:
         print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
 
 
-def print_aggregate_table(results_list: list[dict[str, Any]]) -> None:
+def print_aggregate_table(results_list: list[dict[str, Any]], strict: bool = False) -> None:
     headers = [
         "tool",
         "pairs",
@@ -2270,10 +2350,15 @@ def print_aggregate_table(results_list: list[dict[str, Any]]) -> None:
         "baseline non-cached",
         "tool non-cached",
         "non-cached improvement",
+        "baseline cost",
+        "tool cost",
+        "cost improvement",
+        "cost 95% ci",
         "positive non-cached",
         "mechanism",
+        "methodology",
     ]
-    rows = aggregate_rows(results_list)
+    rows = aggregate_rows(results_list, strict=strict)
     widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * widths[i] for i in range(len(headers))))
@@ -2281,7 +2366,7 @@ def print_aggregate_table(results_list: list[dict[str, Any]]) -> None:
         print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
 
 
-def aggregate_rows(results_list: list[dict[str, Any]]) -> list[list[str]]:
+def aggregate_rows(results_list: list[dict[str, Any]], strict: bool = False) -> list[list[str]]:
     aggregate: dict[str, dict[str, Any]] = {}
     for results in results_list:
         baseline_id = str(results["baseline"])
@@ -2311,15 +2396,27 @@ def aggregate_rows(results_list: list[dict[str, Any]]) -> list[list[str]]:
                         "tool_total": 0,
                         "base_non_cached": 0,
                         "tool_non_cached": 0,
+                        "base_cost": 0.0,
+                        "tool_cost": 0.0,
                         "positive_non_cached": 0,
+                        "cost_improvements": [],
+                        "methodology_excluded": 0,
                     },
                 )
                 if not mechanism_observed(tool, baseline_id):
                     bucket["invalid"] += 1
                     continue
+                if strict and not (methodology_passed(baseline) and methodology_passed(tool)):
+                    bucket["methodology_excluded"] += 1
+                    continue
                 tool_tokens = tool.get("token_total")
                 tool_non_cached = run_non_cached_tokens(tool)
                 if tool_tokens is None or tool_non_cached is None:
+                    bucket["invalid"] += 1
+                    continue
+                base_cost = run_api_cost(baseline)
+                tool_cost = run_api_cost(tool)
+                if base_cost is None or tool_cost is None:
                     bucket["invalid"] += 1
                     continue
                 bucket["pairs"] += 1
@@ -2327,6 +2424,9 @@ def aggregate_rows(results_list: list[dict[str, Any]]) -> list[list[str]]:
                 bucket["tool_total"] += int(tool_tokens)
                 bucket["base_non_cached"] += int(base_non_cached)
                 bucket["tool_non_cached"] += int(tool_non_cached)
+                bucket["base_cost"] += base_cost
+                bucket["tool_cost"] += tool_cost
+                bucket["cost_improvements"].append((base_cost - tool_cost) / base_cost * 100 if base_cost else 0.0)
                 if tool_non_cached < base_non_cached:
                     bucket["positive_non_cached"] += 1
 
@@ -2335,7 +2435,25 @@ def aggregate_rows(results_list: list[dict[str, Any]]) -> list[list[str]]:
         pairs = int(bucket["pairs"])
         invalid = int(bucket["invalid"])
         if pairs == 0:
-            rows.append([variant_id, "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "not observed"])
+            rows.append(
+                [
+                    variant_id,
+                    "0",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "0/0",
+                    "not observed",
+                    aggregate_methodology_cell(bucket),
+                ]
+            )
             continue
         mechanism = "observed" if invalid == 0 else f"observed ({invalid} excluded)"
         rows.append(
@@ -2348,11 +2466,16 @@ def aggregate_rows(results_list: list[dict[str, Any]]) -> list[list[str]]:
                 format_int_cell(bucket["base_non_cached"]),
                 format_int_cell(bucket["tool_non_cached"]),
                 pct_improvement(bucket["base_non_cached"], bucket["tool_non_cached"]),
+                format_cost_cell(bucket["base_cost"]),
+                format_cost_cell(bucket["tool_cost"]),
+                pct_improvement_float(bucket["base_cost"], bucket["tool_cost"]),
+                ci_cell(bucket["cost_improvements"]),
                 f"{bucket['positive_non_cached']}/{pairs}",
                 mechanism,
+                aggregate_methodology_cell(bucket),
             ]
         )
-    return rows or [["no comparable tool rows", "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "n/a"]]
+    return rows or [["no comparable tool rows", "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "n/a", "n/a"]]
 
 
 def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]]:
@@ -2447,6 +2570,38 @@ def run_non_cached_tokens(run: dict[str, Any]) -> int | None:
     if total is None:
         return None
     return max(0, int(total) - int(cached or 0))
+
+
+def run_api_cost(run: dict[str, Any]) -> float | None:
+    usage = run.get("token_usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = int(usage.get("input_tokens") or 0)
+    cached = int(usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens") or 0)
+    output = int(usage.get("output_tokens") or 0)
+    fresh = max(0, input_tokens - cached)
+    return (
+        fresh / 1_000_000 * GPT55_SHORT_CONTEXT_PRICES["fresh_input_per_m"]
+        + cached / 1_000_000 * GPT55_SHORT_CONTEXT_PRICES["cached_input_per_m"]
+        + output / 1_000_000 * GPT55_SHORT_CONTEXT_PRICES["output_per_m"]
+    )
+
+
+def methodology_passed(run: dict[str, Any]) -> bool:
+    audit = run.get("methodology_audit")
+    if not isinstance(audit, dict):
+        return False
+    return audit.get("ok") is True
+
+
+def aggregate_methodology_cell(bucket: dict[str, Any]) -> str:
+    excluded = int(bucket.get("methodology_excluded") or 0)
+    pairs = int(bucket.get("pairs") or 0)
+    if excluded:
+        return f"strict pass ({excluded} excluded)"
+    if pairs:
+        return "pass"
+    return "n/a"
 
 
 def mechanism_observed(run: dict[str, Any], baseline_id: str) -> bool:
@@ -2757,6 +2912,52 @@ def pct_improvement(baseline: int, tool: int) -> str:
     if baseline <= 0:
         return "n/a"
     return f"{((baseline - tool) / baseline * 100):+.1f}%"
+
+
+def pct_improvement_float(baseline: float, tool: float) -> str:
+    if baseline <= 0:
+        return "n/a"
+    return f"{((baseline - tool) / baseline * 100):+.1f}%"
+
+
+def format_cost_cell(value: float | None) -> str:
+    return "n/a" if value is None else f"${value:.2f}"
+
+
+def ci_cell(values: list[float]) -> str:
+    if not values:
+        return "n/a"
+    if len(values) == 1:
+        return f"{values[0]:+.1f}%"
+    samples = bootstrap_means(values, iterations=2000, seed=17)
+    lower = percentile(samples, 2.5)
+    upper = percentile(samples, 97.5)
+    return f"{lower:+.1f}%..{upper:+.1f}%"
+
+
+def bootstrap_means(values: list[float], iterations: int, seed: int) -> list[float]:
+    rng = random.Random(seed)
+    n = len(values)
+    out = []
+    for _ in range(iterations):
+        total = 0.0
+        for _ in range(n):
+            total += values[rng.randrange(n)]
+        out.append(total / n)
+    out.sort()
+    return out
+
+
+def percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = (len(sorted_values) - 1) * pct / 100
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
 def scrub_suite(suite: dict[str, Any]) -> dict[str, Any]:

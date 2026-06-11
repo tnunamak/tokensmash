@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tokensmash.cli import aggregate_rows, comparison_rows, eval_sessions, prepare_variant_codex_home  # noqa: E402
+from tokensmash.cli import audit_run_methodology, aggregate_rows, comparison_rows, eval_sessions, prepare_variant_codex_home  # noqa: E402
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -144,7 +144,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "replicate": 1,
                     "variant_id": "rtk",
                     "token_total": 800,
-                    "token_usage": {"total_tokens": 800, "cached_input_tokens": 650},
+                    "token_usage": {"input_tokens": 760, "cached_input_tokens": 650, "output_tokens": 40, "total_tokens": 800},
                     "mechanism_checks": {"required": True, "ok": True, "checks": []},
                 },
             ],
@@ -170,7 +170,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "replicate": 1,
                     "variant_id": "baseline",
                     "token_total": 1000,
-                    "token_usage": {"total_tokens": 1000, "cached_input_tokens": 700},
+                    "token_usage": {"input_tokens": 950, "cached_input_tokens": 700, "output_tokens": 50, "total_tokens": 1000},
                 },
                 {
                     "success": True,
@@ -178,7 +178,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "replicate": 1,
                     "variant_id": "rtk",
                     "token_total": 800,
-                    "token_usage": {"total_tokens": 800, "cached_input_tokens": 650},
+                    "token_usage": {"input_tokens": 760, "cached_input_tokens": 650, "output_tokens": 40, "total_tokens": 800},
                     "mechanism_checks": {"required": True, "ok": True, "checks": []},
                 },
             ],
@@ -192,7 +192,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "replicate": 1,
                     "variant_id": "baseline",
                     "token_total": 2000,
-                    "token_usage": {"total_tokens": 2000, "cached_input_tokens": 1000},
+                    "token_usage": {"input_tokens": 1900, "cached_input_tokens": 1000, "output_tokens": 100, "total_tokens": 2000},
                 },
                 {
                     "success": True,
@@ -200,7 +200,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "replicate": 1,
                     "variant_id": "rtk",
                     "token_total": 2200,
-                    "token_usage": {"total_tokens": 2200, "cached_input_tokens": 900},
+                    "token_usage": {"input_tokens": 2050, "cached_input_tokens": 900, "output_tokens": 150, "total_tokens": 2200},
                     "mechanism_checks": {"required": True, "ok": True, "checks": []},
                 },
             ],
@@ -216,7 +216,8 @@ class EvalSessionsTest(unittest.TestCase):
         self.assertEqual(rows[0][5], "1,300")
         self.assertEqual(rows[0][6], "1,450")
         self.assertEqual(rows[0][7], "-11.5%")
-        self.assertEqual(rows[0][8], "1/2")
+        self.assertEqual(rows[0][12], "1/2")
+        self.assertEqual(rows[0][14], "pass")
 
     def test_isolated_codex_home_sets_home_under_case_dir(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -235,6 +236,37 @@ class EvalSessionsTest(unittest.TestCase):
             self.assertEqual(env["HOME"], str(case_dir / "home"))
             self.assertEqual(env["CODEX_HOME"], str(case_dir / "home" / ".codex"))
             self.assertTrue((case_dir / "home" / ".codex" / "auth.json").exists())
+
+    def test_methodology_audit_requires_isolated_session_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            case_dir = Path(tmp) / "case"
+            session = case_dir / "home" / ".codex" / "sessions" / "session.jsonl"
+            session.parent.mkdir(parents=True)
+            session.write_text("{}\n")
+            result = {
+                "agent_exit_code": 0,
+                "agent_timed_out": False,
+                "case_dir": str(case_dir),
+                "session_path": str(session),
+                "success_commands": [{"exit_code": 0}],
+                "token_total": 100,
+                "token_usage": {
+                    "input_tokens": 90,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 10,
+                    "total_tokens": 100,
+                },
+                "variant_id": "baseline",
+            }
+
+            audit = audit_run_methodology(result, {"isolated_home": True}, "baseline")
+
+            self.assertTrue(audit["ok"])
+
+            result["session_path"] = str(Path(tmp) / "outside.jsonl")
+            audit = audit_run_methodology(result, {"isolated_home": True}, "baseline")
+
+            self.assertFalse(audit["ok"])
 
 
 if __name__ == "__main__":

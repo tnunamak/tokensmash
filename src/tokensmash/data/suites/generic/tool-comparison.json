@@ -27,6 +27,8 @@
     {
       "id": "baseline_no_user_config",
       "label": "Baseline: no user config, MCP, hooks, or repo rules",
+      "codex_home": true,
+      "isolated_home": true,
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -46,6 +48,7 @@
       "id": "context_mode",
       "label": "context-mode MCP plus lifecycle hooks",
       "codex_home": true,
+      "isolated_home": true,
       "codex_config": "[features]\nhooks = true\n\n[mcp_servers.context-mode]\ncommand = \"context-mode\"\n[mcp_servers.context-mode.env]\nCONTEXT_MODE_PLATFORM = \"codex\"",
       "codex_hooks": "context-mode",
       "codex_args": [
@@ -188,6 +191,7 @@
       "id": "rtk",
       "label": "RTK Claude hook or Codex AGENTS/RTK instructions",
       "codex_home": true,
+      "isolated_home": true,
       "codex_home_files": {
         "AGENTS.md": "@RTK.md",
         "RTK.md": "# RTK - Rust Token Killer (Codex CLI)\n\nAlways prefix shell commands with `rtk --ultra-compact` when the wrapper preserves command semantics. Prefer `rtk git`, `rtk grep`, `rtk find`, `rtk go test`, `rtk npm`, `rtk pytest`, and `rtk test` over raw high-output commands.\n\nUse `rtk proxy <cmd>` only when full raw output is required."
@@ -264,6 +268,7 @@
       "id": "repomix",
       "label": "Repomix MCP incremental repository packing",
       "codex_home": true,
+      "isolated_home": true,
       "codex_config": "[mcp_servers.repomix]\ncommand = \"npx\"\nargs = [\"--yes\", \"repomix@latest\", \"--mcp\"]",
       "claude_mcp_config": {
         "mcpServers": {
