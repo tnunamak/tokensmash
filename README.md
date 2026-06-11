@@ -6,6 +6,23 @@ Tokensmash is a benchmark harness for answering one practical question:
 
 The primary metric is provider-reported session tokens, not a tool's self-reported savings.
 
+## Current Results
+
+Reference smoke run, 2026-06-11:
+
+| tool         | baseline tokens | tool tokens | improvement | model   | reasoning | task class                 | oracle        | result |
+| ------------ | --------------- | ----------- | ----------- | ------- | --------- | -------------------------- | ------------- | ------ |
+| context_mode | 1265375         | 643229      | +49.2%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+| headroom     | 1265375         | 591837      | +53.2%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+| rtk          | 1265375         | 696266      | +45.0%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+| semmap       | 999151          | 879352      | +12.0%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+| repomix      | 620319          | 1309307     | -111.1%     | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+| gitingest    | 620319          | 949669      | -53.1%      | gpt-5.5 | low       | single Go repository task  | go test ./... | pass   |
+
+Interpretation: this is a smoke result, not a leaderboard. It is one task, one
+replicate per row, Codex CLI only, and rows came from multiple bounded batches
+with paired baselines per batch.
+
 ## What It Measures
 
 Tokensmash runs paired baseline/tool variants in disposable Git checkouts, verifies the task with an execution oracle, and reads final Codex session token totals from local session logs.
