@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "name": "generic-agent-tool-comparison",
+  "baseline": "baseline_no_user_config",
+  "model": "${TOKENSMASH_MODEL:-gpt-5.5}",
+  "reasoning": "${TOKENSMASH_REASONING:-low}",
+  "sandbox": "workspace-write",
+  "replicates": 1,
+  "timeout_seconds": 1800,
+  "tasks": [
+    {
+      "id": "target-repo-task",
+      "repo": "${TARGET_REPO}",
+      "base_ref": "${TARGET_BASE_REF:-HEAD}",
+      "prompt": "${TARGET_PROMPT}",
+      "success_commands": [
+        "${TARGET_TEST_COMMAND}"
+      ],
+      "success_timeout_seconds": 300
+    }
+  ],
+  "variants": [
+    {
+      "id": "baseline_no_user_config",
+      "label": "Baseline: no user config, MCP, hooks, or repo rules",
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND"
+        ]
+      },
+      "codex_args": [
+        "--ignore-user-config",
+        "--ignore-rules"
+      ]
+    },
+    {
+      "id": "context_mode",
+      "label": "context-mode MCP plus Codex lifecycle hooks",
+      "codex_home": true,
+      "codex_config": "[features]\nhooks = true\n\n[mcp_servers.context-mode]\ncommand = \"context-mode\"",
+      "codex_hooks": "context-mode",
+      "codex_args": [
+        "--ignore-rules",
+        "--dangerously-bypass-hook-trust"
+      ],
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND"
+        ],
+        "commands": [
+          "context-mode"
+        ]
+      }
+    },
+    {
+      "id": "headroom",
+      "label": "Headroom MCP exposed to Codex",
+      "codex_home": true,
+      "codex_config": "[features]\nhooks = false\n\n[mcp_servers.headroom]\ncommand = \"headroom\"",
+      "codex_args": [
+        "--ignore-rules"
+      ],
+      "prompt_prefix": "Use the Headroom MCP tools if they would reduce repository discovery or retained context. Do not use them if they do not help this task.",
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND"
+        ],
+        "commands": [
+          "headroom"
+        ]
+      }
+    },
+    {
+      "id": "rtk",
+      "label": "RTK shell-output reducers by instruction",
+      "codex_args": [
+        "--ignore-user-config",
+        "--ignore-rules"
+      ],
+      "prompt_prefix": "When running shell commands, prefer RTK wrappers where they preserve semantics and reduce output, for example `rtk go test ./...`, `rtk grep`, `rtk find`, and `rtk git`.",
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND"
+        ],
+        "commands": [
+          "rtk"
+        ]
+      }
+    },
+    {
+      "id": "semmap",
+      "label": "SEMMAP architecture map before editing",
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND",
+          "SEMMAP_BIN"
+        ]
+      },
+      "setup_commands": [
+        "\"$SEMMAP_BIN\" generate --root \"{repo_dir}\" --output \"{run_dir}/SEMMAP.md\""
+      ],
+      "prompt_prefix": "Before searching broadly, inspect the generated SEMMAP at {run_dir}/SEMMAP.md and use it to choose the smallest set of files to read."
+    },
+    {
+      "id": "repomix",
+      "label": "Repomix repository pack before editing",
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND"
+        ],
+        "commands": [
+          "npx"
+        ]
+      },
+      "setup_commands": [
+        "npx --yes repomix@latest \"{repo_dir}\" --output \"{run_dir}/repomix.md\""
+      ],
+      "prompt_prefix": "A Repomix pack is available at {run_dir}/repomix.md. Use it only if it helps avoid broader repo discovery."
+    },
+    {
+      "id": "gitingest",
+      "label": "Gitingest repository digest before editing",
+      "requires": {
+        "env": [
+          "TARGET_REPO",
+          "TARGET_PROMPT",
+          "TARGET_TEST_COMMAND"
+        ],
+        "commands": [
+          "uvx"
+        ]
+      },
+      "setup_commands": [
+        "uvx gitingest \"{repo_dir}\" -o \"{run_dir}/gitingest.txt\""
+      ],
+      "prompt_prefix": "A Gitingest digest is available at {run_dir}/gitingest.txt. Use it only if it helps avoid broader repo discovery."
+    }
+  ]
+}

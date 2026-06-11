@@ -1,0 +1,28 @@
+[project]
+name = "tokensmash"
+version = "0.1.0"
+description = "A reproducible benchmark harness for measuring agent tool token impact."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Tokensmash contributors" }]
+keywords = ["llm", "agent", "benchmark", "tokens", "codex", "evaluation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+tokensmash = "tokensmash.cli:main"
+tokensmash-ab = "tokensmash.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tokensmash"]

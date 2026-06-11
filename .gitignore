@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local benchmark output; publish sanitized summaries instead.
+.runs/
+raw-results/
+raw-sessions/
+session-logs/
+local-sessions/
+private-sessions/
+*.jsonl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
