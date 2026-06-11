@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tokensmash.cli import comparison_rows, eval_sessions  # noqa: E402
+from tokensmash.cli import aggregate_rows, comparison_rows, eval_sessions, prepare_variant_codex_home  # noqa: E402
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -159,6 +159,82 @@ class EvalSessionsTest(unittest.TestCase):
         self.assertEqual(rows[0][4], "300")
         self.assertEqual(rows[0][5], "150")
         self.assertEqual(rows[0][6], "+50.0%")
+
+    def test_aggregate_rows_sum_paired_successful_runs(self) -> None:
+        result_one = {
+            "baseline": "baseline",
+            "runs": [
+                {
+                    "success": True,
+                    "task_id": "task-a",
+                    "replicate": 1,
+                    "variant_id": "baseline",
+                    "token_total": 1000,
+                    "token_usage": {"total_tokens": 1000, "cached_input_tokens": 700},
+                },
+                {
+                    "success": True,
+                    "task_id": "task-a",
+                    "replicate": 1,
+                    "variant_id": "rtk",
+                    "token_total": 800,
+                    "token_usage": {"total_tokens": 800, "cached_input_tokens": 650},
+                    "mechanism_checks": {"required": True, "ok": True, "checks": []},
+                },
+            ],
+        }
+        result_two = {
+            "baseline": "baseline",
+            "runs": [
+                {
+                    "success": True,
+                    "task_id": "task-b",
+                    "replicate": 1,
+                    "variant_id": "baseline",
+                    "token_total": 2000,
+                    "token_usage": {"total_tokens": 2000, "cached_input_tokens": 1000},
+                },
+                {
+                    "success": True,
+                    "task_id": "task-b",
+                    "replicate": 1,
+                    "variant_id": "rtk",
+                    "token_total": 2200,
+                    "token_usage": {"total_tokens": 2200, "cached_input_tokens": 900},
+                    "mechanism_checks": {"required": True, "ok": True, "checks": []},
+                },
+            ],
+        }
+
+        rows = aggregate_rows([result_one, result_two])
+
+        self.assertEqual(rows[0][0], "rtk")
+        self.assertEqual(rows[0][1], "2")
+        self.assertEqual(rows[0][2], "3,000")
+        self.assertEqual(rows[0][3], "3,000")
+        self.assertEqual(rows[0][4], "+0.0%")
+        self.assertEqual(rows[0][5], "1,300")
+        self.assertEqual(rows[0][6], "1,450")
+        self.assertEqual(rows[0][7], "-11.5%")
+        self.assertEqual(rows[0][8], "1/2")
+
+    def test_isolated_codex_home_sets_home_under_case_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            case_dir = Path(tmp) / "case"
+            repo_dir = case_dir / "repo"
+            repo_dir.mkdir(parents=True)
+            env = {}
+
+            prepare_variant_codex_home(
+                {"codex_home": True, "isolated_home": True},
+                case_dir,
+                repo_dir,
+                env,
+            )
+
+            self.assertEqual(env["HOME"], str(case_dir / "home"))
+            self.assertEqual(env["CODEX_HOME"], str(case_dir / "home" / ".codex"))
+            self.assertTrue((case_dir / "home" / ".codex" / "auth.json").exists())
 
 
 if __name__ == "__main__":

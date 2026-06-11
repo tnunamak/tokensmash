@@ -144,6 +144,7 @@
       "id": "headroom",
       "label": "Headroom wrap proxy for automatic request compression",
       "codex_home": true,
+      "isolated_home": true,
       "codex_wrapper": [
         "headroom",
         "wrap",
@@ -159,17 +160,17 @@
       "codex_mechanism_checks": [
         {
           "type": "file_regex",
-          "label": "Headroom routed requests",
+          "label": "Headroom proxy launch",
           "path": "{run_dir}/codex.stdout",
-          "pattern": "(?:routed[^0-9\\n]{0,40}[1-9][0-9]*|[1-9][0-9]*[^\\n]{0,80}routed)"
+          "pattern": "HEADROOM WRAP: CODEX|API routed through Headroom|OPENAI_BASE_URL=http://127\\.0\\.0\\.1:[0-9]+/v1"
         }
       ],
       "claude_mechanism_checks": [
         {
           "type": "file_regex",
-          "label": "Headroom routed requests",
+          "label": "Headroom proxy launch",
           "path": "{run_dir}/claude.stdout",
-          "pattern": "(?:routed[^0-9\\n]{0,40}[1-9][0-9]*|[1-9][0-9]*[^\\n]{0,80}routed)"
+          "pattern": "HEADROOM WRAP: CLAUDE|API routed through Headroom|ANTHROPIC_BASE_URL=http://127\\.0\\.0\\.1:[0-9]+"
         }
       ],
       "requires": {

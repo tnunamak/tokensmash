@@ -55,6 +55,9 @@ def main() -> int:
     table = sub.add_parser("table", help="Print baseline/tool/improvement table.")
     table.add_argument("results", help="Run directory or results.json.")
 
+    aggregate = sub.add_parser("aggregate", help="Aggregate comparable tool rows across result files.")
+    aggregate.add_argument("results", nargs="+", help="Run directories or results.json files.")
+
     report = sub.add_parser("report", help="Write a benchmark-card Markdown report.")
     report.add_argument("results", nargs="+", help="Run directories or results.json files.")
     report.add_argument("-o", "--output", required=True, help="Markdown output path.")
@@ -111,6 +114,10 @@ def main() -> int:
         if path.is_dir():
             path = path / "results.json"
         print_table(load_results(path))
+        return 0
+    if args.cmd == "aggregate":
+        results = [load_results(resolve_results_path(Path(path))) for path in args.results]
+        print_aggregate_table(results)
         return 0
     if args.cmd == "report":
         results = [load_results(resolve_results_path(Path(path))) for path in args.results]
@@ -402,7 +409,13 @@ def prepare_variant_codex_home(
 ) -> None:
     if not variant.get("codex_home"):
         return
-    codex_home = case_dir / "codex-home"
+    if variant.get("isolated_home"):
+        home = case_dir / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)
+        codex_home = home / ".codex"
+    else:
+        codex_home = case_dir / "codex-home"
     codex_home.mkdir(parents=True, exist_ok=True)
     auth = Path.home() / ".codex" / "auth.json"
     require(auth.exists(), f"missing Codex auth file: {auth}")
@@ -2245,6 +2258,101 @@ def print_table(results: dict[str, Any]) -> None:
     print("  ".join("-" * widths[i] for i in range(len(headers))))
     for row in rows:
         print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
+
+
+def print_aggregate_table(results_list: list[dict[str, Any]]) -> None:
+    headers = [
+        "tool",
+        "pairs",
+        "baseline total",
+        "tool total",
+        "total improvement",
+        "baseline non-cached",
+        "tool non-cached",
+        "non-cached improvement",
+        "positive non-cached",
+        "mechanism",
+    ]
+    rows = aggregate_rows(results_list)
+    widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
+
+
+def aggregate_rows(results_list: list[dict[str, Any]]) -> list[list[str]]:
+    aggregate: dict[str, dict[str, Any]] = {}
+    for results in results_list:
+        baseline_id = str(results["baseline"])
+        grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+        for run in results.get("runs", []):
+            if not run.get("success"):
+                continue
+            key = (str(run.get("task_id")), int(run.get("replicate") or 1))
+            grouped.setdefault(key, {})[str(run.get("variant_id"))] = run
+        for by_variant in grouped.values():
+            baseline = by_variant.get(baseline_id)
+            if not baseline:
+                continue
+            base_tokens = baseline.get("token_total")
+            base_non_cached = run_non_cached_tokens(baseline)
+            if base_tokens is None or base_non_cached is None:
+                continue
+            for variant_id, tool in by_variant.items():
+                if variant_id == baseline_id:
+                    continue
+                bucket = aggregate.setdefault(
+                    variant_id,
+                    {
+                        "pairs": 0,
+                        "invalid": 0,
+                        "base_total": 0,
+                        "tool_total": 0,
+                        "base_non_cached": 0,
+                        "tool_non_cached": 0,
+                        "positive_non_cached": 0,
+                    },
+                )
+                if not mechanism_observed(tool, baseline_id):
+                    bucket["invalid"] += 1
+                    continue
+                tool_tokens = tool.get("token_total")
+                tool_non_cached = run_non_cached_tokens(tool)
+                if tool_tokens is None or tool_non_cached is None:
+                    bucket["invalid"] += 1
+                    continue
+                bucket["pairs"] += 1
+                bucket["base_total"] += int(base_tokens)
+                bucket["tool_total"] += int(tool_tokens)
+                bucket["base_non_cached"] += int(base_non_cached)
+                bucket["tool_non_cached"] += int(tool_non_cached)
+                if tool_non_cached < base_non_cached:
+                    bucket["positive_non_cached"] += 1
+
+    rows: list[list[str]] = []
+    for variant_id, bucket in sorted(aggregate.items()):
+        pairs = int(bucket["pairs"])
+        invalid = int(bucket["invalid"])
+        if pairs == 0:
+            rows.append([variant_id, "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "not observed"])
+            continue
+        mechanism = "observed" if invalid == 0 else f"observed ({invalid} excluded)"
+        rows.append(
+            [
+                variant_id,
+                str(pairs),
+                format_int_cell(bucket["base_total"]),
+                format_int_cell(bucket["tool_total"]),
+                pct_improvement(bucket["base_total"], bucket["tool_total"]),
+                format_int_cell(bucket["base_non_cached"]),
+                format_int_cell(bucket["tool_non_cached"]),
+                pct_improvement(bucket["base_non_cached"], bucket["tool_non_cached"]),
+                f"{bucket['positive_non_cached']}/{pairs}",
+                mechanism,
+            ]
+        )
+    return rows or [["no comparable tool rows", "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "n/a"]]
 
 
 def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]]:
