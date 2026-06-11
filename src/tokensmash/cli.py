@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,25 @@ def main() -> int:
     sessions.add_argument("--limit-files", type=int, default=500)
     sessions.add_argument("-o", "--output", help="Write sanitized JSON summary.")
 
+    eval_sessions_parser = sub.add_parser(
+        "eval-sessions",
+        help="Evaluate token-saving tools against real local agent sessions.",
+    )
+    eval_sessions_parser.add_argument("--agent", choices=["codex"], default="codex")
+    eval_sessions_parser.add_argument("--codex-root", default=str(CODEX_SESSIONS_DIR))
+    eval_sessions_parser.add_argument("--repo-root", default=str(Path.cwd()), help="Repository root for artifact-tool evaluation.")
+    eval_sessions_parser.add_argument("--latest", type=int, default=5, help="Number of recent Codex sessions to evaluate.")
+    eval_sessions_parser.add_argument("--session", action="append", default=[], help="Specific Codex JSONL session path.")
+    eval_sessions_parser.add_argument(
+        "--tools",
+        default="rtk,context-mode,semmap,repomix,gitingest,headroom",
+        help="Comma-separated tools to evaluate.",
+    )
+    eval_sessions_parser.add_argument("--semmap-bin", default=os.environ.get("SEMMAP_BIN", "semmap"))
+    eval_sessions_parser.add_argument("--headroom-perf", help="Headroom perf raw JSON from `headroom perf --format json --raw`.")
+    eval_sessions_parser.add_argument("--no-artifacts", action="store_true", help="Skip local SEMMAP/Repomix/Gitingest artifact generation.")
+    eval_sessions_parser.add_argument("-o", "--output", help="Write sanitized JSON result.")
+
     args = parser.parse_args()
     if args.cmd == "plan":
         suite = load_suite(Path(args.suite))
@@ -104,6 +124,15 @@ def main() -> int:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+            print(f"wrote {output}")
+        return 0
+    if args.cmd == "eval-sessions":
+        result = eval_sessions(args)
+        print_eval_sessions_table(result)
+        if args.output:
+            output = Path(args.output).expanduser()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
             print(f"wrote {output}")
         return 0
     return 2
@@ -1312,6 +1341,731 @@ def print_session_summary(summary: dict[str, Any]) -> None:
             f"{agent['total_tokens']:<6}  {agent['tool_calls']:<10}  "
             f"{agent['tool_output_bytes']:<17}  {agent['token_confidence']}"
         )
+
+
+EVAL_TOOL_ORDER = ["rtk", "context-mode", "semmap", "repomix", "gitingest", "headroom"]
+ARTIFACT_TOOLS = {"semmap", "repomix", "gitingest"}
+RTK_SAVING_SUBCOMMANDS = {
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "diff",
+    "git",
+    "test",
+    "cargo",
+    "npm",
+    "pnpm",
+    "yarn",
+    "pytest",
+    "log",
+    "json",
+    "summary",
+    "deps",
+    "env",
+    "gh",
+    "docker",
+    "kubectl",
+}
+
+
+def eval_sessions(args: argparse.Namespace) -> dict[str, Any]:
+    tools = selected_eval_tools(args.tools)
+    repo_root = Path(args.repo_root).expanduser().resolve()
+    session_paths = selected_codex_eval_session_files(
+        Path(args.codex_root).expanduser(),
+        [Path(path).expanduser() for path in args.session],
+        args.latest,
+    )
+    sessions, pressure_events, file_refs = extract_codex_eval_pressure(session_paths, repo_root)
+    artifact_rows = [] if args.no_artifacts else eval_artifact_tools(tools, repo_root, file_refs, args.semmap_bin)
+    headroom_row = eval_headroom_perf(Path(args.headroom_perf).expanduser()) if args.headroom_perf else None
+    rows = []
+    for tool in tools:
+        if tool in ARTIFACT_TOOLS:
+            row = next((item for item in artifact_rows if item["tool_id"] == tool), missing_eval_row(tool))
+        elif tool == "headroom":
+            row = headroom_row or missing_eval_row(
+                tool,
+                verdict="needs --headroom-perf evidence; no live canary is run by default",
+            )
+        else:
+            row = eval_pressure_tool(tool, [event for event in pressure_events if event["tool_id"] == tool])
+        rows.append(row)
+    return {
+        "schema": 1,
+        "kind": "tokensmash-eval-sessions",
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "agent": "codex",
+        "repo_root": str(repo_root),
+        "session_count": len(sessions),
+        "sessions": sessions,
+        "rows": rows,
+        "privacy": [
+            "raw prompts, assistant messages, and tool outputs are not emitted",
+            "session file paths are hashed",
+            "commands are retained only to attribute mechanism use",
+        ],
+    }
+
+
+def selected_eval_tools(value: str) -> list[str]:
+    aliases = {"context_mode": "context-mode", "ctx": "context-mode"}
+    requested = []
+    for raw in (value or "").split(","):
+        tool = aliases.get(raw.strip().lower(), raw.strip().lower())
+        if tool and tool not in requested:
+            requested.append(tool)
+    allowed = set(EVAL_TOOL_ORDER)
+    unknown = sorted(set(requested) - allowed)
+    require(not unknown, f"unknown eval tool(s): {', '.join(unknown)}")
+    return requested or list(EVAL_TOOL_ORDER)
+
+
+def selected_codex_eval_session_files(root: Path, explicit: list[Path], latest: int) -> list[Path]:
+    selected: list[Path] = []
+    seen: set[str] = set()
+    for path in explicit:
+        if not path.exists() or not path.is_file():
+            continue
+        key = str(path.resolve())
+        if key not in seen:
+            selected.append(path)
+            seen.add(key)
+    remaining = max(0, int(latest or 0) - len(selected))
+    if remaining and root.exists():
+        candidates = recent_session_files(root, cutoff=0, limit=max(remaining * 20, remaining))
+        for path in candidates:
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            selected.append(path)
+            seen.add(key)
+            if len(selected) >= int(latest or 0):
+                break
+    return selected
+
+
+def extract_codex_eval_pressure(
+    session_paths: list[Path],
+    repo_root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    sessions = []
+    events = []
+    file_refs: set[str] = set()
+    for path in session_paths:
+        session, session_events, session_files = extract_one_codex_eval_session(path, repo_root)
+        sessions.append(session)
+        events.extend(session_events)
+        file_refs.update(session_files)
+    return sessions, events, file_refs
+
+
+def extract_one_codex_eval_session(path: Path, repo_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]], set[str]]:
+    calls: dict[str, dict[str, Any]] = {}
+    events: list[dict[str, Any]] = []
+    file_refs: set[str] = set()
+    token_usage: dict[str, Any] = {}
+    event_count = 0
+    tool_calls = 0
+    tool_output_bytes = 0
+    cwd = ""
+    for obj in iter_jsonl(path):
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
+        if not isinstance(payload, dict):
+            continue
+        event_count += 1
+        typ = str(payload.get("type") or obj.get("type") or "")
+        cwd = cwd or str((obj.get("payload") or {}).get("cwd") or payload.get("cwd") or "")
+        if typ == "turn_context" and isinstance(payload.get("cwd"), str):
+            cwd = str(payload["cwd"])
+        if typ == "token_count":
+            candidate = ((payload.get("info") or {}).get("total_token_usage") or {})
+            if isinstance(candidate, dict):
+                token_usage = candidate
+        if typ in {"function_call", "custom_tool_call", "mcp_tool_call_begin"}:
+            tool_calls += 1
+            call_id = str(payload.get("call_id") or "")
+            if call_id:
+                calls[call_id] = codex_call_info(payload)
+                command = str(calls[call_id].get("command") or "")
+                file_refs.update(repo_relative_paths_from_text(command, repo_root))
+        if typ in {"function_call_output", "custom_tool_call_output", "mcp_tool_call_end"}:
+            output = codex_output_text(payload)
+            tool_output_bytes += len(output.encode("utf-8", "replace"))
+            if not output:
+                continue
+            call_id = str(payload.get("call_id") or "")
+            call = calls.get(call_id, {})
+            tool_id = classify_codex_pressure_event(call, payload, output)
+            if not tool_id:
+                continue
+            event = build_pressure_event(tool_id, call, payload, output, path)
+            if event:
+                events.append(event)
+                file_refs.update(repo_relative_paths_from_text(str(call.get("command") or ""), repo_root))
+                file_refs.update(repo_relative_paths_from_text(output[:20000], repo_root))
+    stats = {
+        "source_file_sha256": sha_text(str(path)),
+        "source_file_mtime": dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat(),
+        "cwd": cwd,
+        "event_count": event_count,
+        "tool_calls": tool_calls,
+        "tool_output_bytes": tool_output_bytes,
+        "total_tokens": normalize_total_tokens(token_usage),
+        "pressure_events": len(events),
+    }
+    return stats, events, file_refs
+
+
+def codex_call_info(payload: dict[str, Any]) -> dict[str, Any]:
+    invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
+    arguments = codex_call_arguments(payload)
+    command = ""
+    for key in ("cmd", "command", "shell_command"):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            command = value
+            break
+    return {
+        "name": str(payload.get("name") or invocation.get("tool") or ""),
+        "namespace": str(payload.get("namespace") or invocation.get("server") or ""),
+        "arguments": arguments,
+        "command": command,
+    }
+
+
+def codex_call_arguments(payload: dict[str, Any]) -> dict[str, Any]:
+    invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
+    for value in (payload.get("arguments"), payload.get("input"), invocation.get("arguments")):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def classify_codex_pressure_event(call: dict[str, Any], payload: dict[str, Any], output: str) -> str | None:
+    name = str(call.get("name") or "")
+    namespace = str(call.get("namespace") or "")
+    command = str(call.get("command") or "")
+    invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
+    if not name and invocation:
+        name = str(invocation.get("tool") or "")
+        namespace = str(invocation.get("server") or "")
+    if is_context_mode_call(name, namespace):
+        return "context-mode"
+    if is_rtk_saving_command(command):
+        return "rtk"
+    lowered = f"{name} {namespace} {command} {output[:400]}".lower()
+    if "repomix" in lowered:
+        return "repomix"
+    if "gitingest" in lowered:
+        return "gitingest"
+    if "semmap" in lowered:
+        return "semmap"
+    if "headroom" in lowered:
+        return "headroom"
+    return None
+
+
+def is_context_mode_call(name: str, namespace: str) -> bool:
+    lowered = f"{namespace} {name}".lower()
+    return "context-mode" in lowered or name.lower().startswith("ctx_")
+
+
+def is_rtk_saving_command(command: str) -> bool:
+    if not command:
+        return False
+    for match in re.finditer(r"(?:^|[;&|]\s*)rtk\s+([A-Za-z0-9:_-]+)", command):
+        subcommand = match.group(1).split(":", 1)[0].lower()
+        if subcommand in RTK_SAVING_SUBCOMMANDS:
+            return True
+    return False
+
+
+def build_pressure_event(
+    tool_id: str,
+    call: dict[str, Any],
+    payload: dict[str, Any],
+    output: str,
+    session_path: Path,
+) -> dict[str, Any] | None:
+    before = inferred_before_tokens(tool_id, output)
+    after = approximate_text_tokens(output)
+    if before is None:
+        return None
+    return {
+        "tool_id": tool_id,
+        "session_sha256": sha_text(str(session_path)),
+        "call_id_sha256": sha_text(str(payload.get("call_id") or "")),
+        "command": str(call.get("command") or ""),
+        "name": str(call.get("name") or ""),
+        "before_tokens": before,
+        "after_tokens": after,
+        "improvement_percent": pct_reduction(before, after),
+    }
+
+
+def inferred_before_tokens(tool_id: str, output: str) -> int | None:
+    explicit = parse_original_token_count(output)
+    if explicit:
+        return explicit
+    if tool_id == "context-mode":
+        return parse_context_mode_before_tokens(output)
+    return None
+
+
+def parse_original_token_count(output: str) -> int | None:
+    match = re.search(r"Original token count:\s*([\d,]+)", output)
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
+def parse_context_mode_before_tokens(output: str) -> int | None:
+    matches = re.findall(r"\(([\d,]+)\s+lines,\s*([\d.]+)\s*KB\)", output, flags=re.IGNORECASE)
+    if not matches:
+        return None
+    # Context-mode reports the raw source volume it indexed/searched. That is the closest
+    # offline proxy for what a raw shell/file read would have pressured into context.
+    kb_total = sum(float(kb) for _, kb in matches)
+    return max(1, round(kb_total * 256))
+
+
+def approximate_text_tokens(text: str) -> int:
+    return max(1, round(len(text) / 4)) if text else 0
+
+
+def normalize_total_tokens(usage: dict[str, Any]) -> int:
+    return int(
+        usage.get("total_tokens")
+        or usage.get("totalTokenCount")
+        or (
+            int(usage.get("input_tokens") or 0)
+            + int(usage.get("cached_input_tokens") or 0)
+            + int(usage.get("output_tokens") or 0)
+            + int(usage.get("reasoning_output_tokens") or 0)
+        )
+    )
+
+
+def repo_relative_paths_from_text(text: str, repo_root: Path) -> set[str]:
+    if not text:
+        return set()
+    paths: set[str] = set()
+    repo = str(repo_root)
+    escaped_repo = re.escape(repo.rstrip("/"))
+    patterns = [
+        rf"{escaped_repo}/[A-Za-z0-9_@%+=:,./~ -]+\.[A-Za-z0-9]{{1,12}}",
+        r"(?<![\w/-])(?:\.?/)?[A-Za-z0-9_@%+=:,./~-]+\.[A-Za-z0-9]{1,12}",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            raw = match.group(0).strip().strip("`'\"),:]")
+            rel = repo_relative_path(raw, repo_root)
+            if rel:
+                paths.add(rel)
+    return paths
+
+
+def repo_relative_path(value: str, repo_root: Path) -> str | None:
+    try:
+        path = Path(value).expanduser()
+    except (OSError, RuntimeError):
+        return None
+    if not path.is_absolute():
+        path = repo_root / path
+    try:
+        resolved = path.resolve()
+        rel = resolved.relative_to(repo_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    if any(part in {".git", ".venv", "node_modules", "dist", "__pycache__"} for part in rel.parts):
+        return None
+    return rel.as_posix()
+
+
+def eval_pressure_tool(tool_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    before = sum(int(event["before_tokens"]) for event in events)
+    after = sum(int(event["after_tokens"]) for event in events)
+    row = base_eval_row(tool_id)
+    row.update(
+        {
+            "mechanism_fired": "yes" if events else "no",
+            "evaluated_on_real_session": "yes" if events else "no",
+            "token_pressure_before": before if events else None,
+            "token_spend_with_tool": after if events else None,
+            "percent_improvement": pct_reduction(before, after) if events else None,
+            "future_session_confidence_percent": pressure_confidence(tool_id, events, before, after),
+            "sample_count": len(events),
+            "verdict": pressure_verdict(tool_id, events, before, after),
+        }
+    )
+    return row
+
+
+def pressure_confidence(tool_id: str, events: list[dict[str, Any]], before: int, after: int) -> int:
+    if not events:
+        return 0
+    if before <= 0 or after < 0:
+        return 35
+    if tool_id == "context-mode":
+        if len(events) >= 10 and before >= 100000:
+            return 94
+        return 92 if len(events) >= 3 and before >= 50000 else 82
+    if tool_id == "rtk":
+        if len(events) >= 10 and before >= 50000:
+            return 93
+        return 90 if len(events) >= 3 and before >= 10000 else 80
+    pct = pct_reduction(before, after)
+    return 70 if pct >= 20 else 55
+
+
+def pressure_verdict(tool_id: str, events: list[dict[str, Any]], before: int, after: int) -> str:
+    if not events:
+        return "not observed in selected sessions"
+    pct = pct_reduction(before, after)
+    if pct > 0:
+        return f"observed {tool_id} savings on selected Codex sessions"
+    if pct == 0:
+        return f"observed {tool_id}, no measured token reduction"
+    return f"observed {tool_id}, but selected events grew token pressure"
+
+
+def eval_artifact_tools(
+    tools: list[str],
+    repo_root: Path,
+    file_refs: set[str],
+    semmap_bin: str,
+) -> list[dict[str, Any]]:
+    wanted = [tool for tool in tools if tool in ARTIFACT_TOOLS]
+    if not wanted:
+        return []
+    from_sessions = bool(file_refs)
+    working_set = focused_working_set(repo_root, file_refs)
+    raw_tokens = raw_file_tokens(repo_root, working_set)
+    rows = []
+    tmp_root = Path.home() / ".tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="tokensmash-eval-", dir=str(tmp_root)) as tmp:
+        temp_dir = Path(tmp)
+        for tool in wanted:
+            rows.append(eval_artifact_tool(tool, repo_root, working_set, raw_tokens, temp_dir, semmap_bin, from_sessions))
+    return rows
+
+
+def focused_working_set(repo_root: Path, file_refs: set[str]) -> list[str]:
+    selected = [path for path in sorted(file_refs) if (repo_root / path).exists()]
+    if selected:
+        return selected[:40]
+    fallbacks = ["src/tokensmash/cli.py", "README.md", "pyproject.toml"]
+    return [path for path in fallbacks if (repo_root / path).exists()]
+
+
+def raw_file_tokens(repo_root: Path, rel_paths: list[str]) -> int:
+    total = 0
+    for rel in rel_paths:
+        path = repo_root / rel
+        try:
+            total += approximate_text_tokens(path.read_text(errors="ignore"))
+        except OSError:
+            continue
+    return total
+
+
+def eval_artifact_tool(
+    tool_id: str,
+    repo_root: Path,
+    working_set: list[str],
+    raw_tokens: int,
+    temp_dir: Path,
+    semmap_bin: str,
+    from_sessions: bool,
+) -> dict[str, Any]:
+    row = base_eval_row(tool_id)
+    if not working_set or raw_tokens <= 0:
+        row["verdict"] = "no readable focused working set"
+        return row
+    output_path = temp_dir / f"{tool_id}.txt"
+    semmap_cache = repo_root / ".semmap"
+    semmap_cache_preexisting = semmap_cache.exists()
+    try:
+        proc = run_artifact_tool(tool_id, repo_root, working_set, output_path, semmap_bin)
+    except subprocess.TimeoutExpired:
+        proc = None
+        row["verdict"] = f"{tool_id} timed out locally"
+    if tool_id == "semmap" and not semmap_cache_preexisting and semmap_cache.exists():
+        shutil.rmtree(semmap_cache, ignore_errors=True)
+    if row["verdict"].endswith("timed out locally"):
+        return row
+    if proc is None:
+        row["verdict"] = f"{tool_id} executable not found"
+        return row
+    if proc.returncode != 0 or not output_path.exists():
+        row["verdict"] = f"{tool_id} failed locally"
+        row["error_sha256"] = hashlib.sha256((proc.stderr or b"") + (proc.stdout or b"")).hexdigest()
+        return row
+    try:
+        artifact_text = output_path.read_text(errors="ignore")
+    except OSError:
+        artifact_text = ""
+    after = approximate_text_tokens(artifact_text)
+    coverage = artifact_coverage(artifact_text, working_set)
+    row.update(
+        {
+            "mechanism_fired": "yes",
+            "evaluated_on_real_session": "yes" if from_sessions else "no",
+            "token_pressure_before": raw_tokens,
+            "token_spend_with_tool": after,
+            "percent_improvement": pct_reduction(raw_tokens, after),
+            "future_session_confidence_percent": artifact_confidence(tool_id, raw_tokens, after, coverage, len(working_set)),
+            "sample_count": len(working_set),
+            "coverage": f"{coverage}/{len(working_set)} files",
+            "verdict": artifact_verdict(tool_id, raw_tokens, after, coverage, len(working_set)),
+        }
+    )
+    return row
+
+
+def run_artifact_tool(
+    tool_id: str,
+    repo_root: Path,
+    working_set: list[str],
+    output_path: Path,
+    semmap_bin: str,
+) -> subprocess.CompletedProcess[bytes] | None:
+    if tool_id == "semmap":
+        binary = resolve_semmap_bin(semmap_bin)
+        if not binary:
+            return None
+        semmap_output = output_path.with_name("SEMMAP.md")
+        return subprocess.run(
+            [binary, "generate", "--root", str(repo_root), "--output", str(semmap_output), "--chat-output", str(output_path)],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    if tool_id == "repomix":
+        if not shutil.which("npx"):
+            return None
+        include = ",".join(working_set)
+        return subprocess.run(
+            [
+                "npx",
+                "--yes",
+                "repomix@latest",
+                str(repo_root),
+                "--include",
+                include,
+                "--compress",
+                "--style",
+                "xml",
+                "--output",
+                str(output_path),
+                "--quiet",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    if tool_id == "gitingest":
+        if not shutil.which("uvx"):
+            return None
+        include_args = [arg for rel in working_set for arg in ("-i", rel)]
+        return subprocess.run(
+            ["uvx", "gitingest", str(repo_root), *include_args, "-o", str(output_path)],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    return None
+
+
+def resolve_semmap_bin(configured: str) -> str | None:
+    candidates = [
+        configured,
+        shutil.which("semmap") or "",
+        str(Path.home() / ".tmp" / "semmap-eval" / "install" / "bin" / "semmap"),
+        str(Path.home() / ".tmp" / "semmap-eval" / "target" / "release" / "semmap"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).expanduser().exists():
+            return str(Path(candidate).expanduser())
+        resolved = shutil.which(candidate) if candidate else None
+        if resolved:
+            return resolved
+    return None
+
+
+def artifact_coverage(text: str, working_set: list[str]) -> int:
+    return sum(1 for path in working_set if path in text or Path(path).name in text)
+
+
+def artifact_confidence(tool_id: str, before: int, after: int, coverage: int, total: int) -> int:
+    if before <= 0 or total <= 0:
+        return 0
+    coverage_ratio = coverage / total
+    pct = pct_reduction(before, after)
+    if coverage_ratio < 0.8:
+        return 45
+    if tool_id == "repomix" and pct >= 20:
+        return 90
+    if tool_id == "semmap" and pct >= 50:
+        return 88
+    if tool_id == "gitingest":
+        return 86 if pct <= 10 else 82
+    return 70 if pct > 0 else 65
+
+
+def artifact_verdict(tool_id: str, before: int, after: int, coverage: int, total: int) -> str:
+    if total and coverage / total < 0.8:
+        return f"{tool_id} output did not cover enough focused files"
+    pct = pct_reduction(before, after)
+    if pct > 0:
+        return f"{tool_id} reduced focused working-set token pressure"
+    if pct == 0:
+        return f"{tool_id} matched raw working-set token pressure"
+    return f"{tool_id} increased focused working-set token pressure"
+
+
+def eval_headroom_perf(path: Path) -> dict[str, Any]:
+    row = base_eval_row("headroom")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        row["verdict"] = "headroom perf evidence unreadable"
+        return row
+    records = data if isinstance(data, list) else data.get("records") if isinstance(data, dict) else []
+    before = 0
+    after = 0
+    seen: set[tuple[int, int, str]] = set()
+    for item in records or []:
+        if not isinstance(item, dict):
+            continue
+        b = first_int(item, ("tokens_before", "before_tokens", "before"))
+        a = first_int(item, ("tokens_after", "after_tokens", "after"))
+        key = (b, a, str(item.get("request_id") or item.get("id") or ""))
+        if b <= 0 or a < 0 or key in seen:
+            continue
+        seen.add(key)
+        before += b
+        after += a
+    if not seen:
+        row["verdict"] = "headroom evidence had no before/after records"
+        return row
+    row.update(
+        {
+            "mechanism_fired": "yes",
+            "evaluated_on_real_session": "no",
+            "token_pressure_before": before,
+            "token_spend_with_tool": after,
+            "percent_improvement": pct_reduction(before, after),
+            "future_session_confidence_percent": 62 if before < 100000 else 78,
+            "sample_count": len(seen),
+            "verdict": "headroom proxy evidence observed; needs real session A/B for default-enable confidence",
+        }
+    )
+    return row
+
+
+def first_int(item: dict[str, Any], keys: tuple[str, ...]) -> int:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.replace(",", "").isdigit():
+            return int(value.replace(",", ""))
+    return 0
+
+
+def base_eval_row(tool_id: str) -> dict[str, Any]:
+    return {
+        "tool_id": tool_id,
+        "tool": display_tool_name(tool_id),
+        "mechanism_fired": "no",
+        "evaluated_on_real_session": "no",
+        "token_pressure_before": None,
+        "token_spend_with_tool": None,
+        "percent_improvement": None,
+        "future_session_confidence_percent": 0,
+        "sample_count": 0,
+        "verdict": "not evaluated",
+    }
+
+
+def missing_eval_row(tool_id: str, verdict: str | None = None) -> dict[str, Any]:
+    row = base_eval_row(tool_id)
+    if verdict:
+        row["verdict"] = verdict
+    return row
+
+
+def display_tool_name(tool_id: str) -> str:
+    return {
+        "rtk": "RTK",
+        "context-mode": "context-mode",
+        "semmap": "SEMMAP",
+        "repomix": "Repomix",
+        "gitingest": "Gitingest",
+        "headroom": "Headroom",
+    }.get(tool_id, tool_id)
+
+
+def pct_reduction(before: int | float, after: int | float) -> float:
+    if before <= 0:
+        return 0.0
+    return round((float(before) - float(after)) / float(before) * 100, 1)
+
+
+def print_eval_sessions_table(result: dict[str, Any]) -> None:
+    headers = [
+        "tool",
+        "mechanism fired?",
+        "real session?",
+        "baseline token spend",
+        "token spend with tool",
+        "percent improvement",
+        "future-session confidence",
+        "verdict",
+    ]
+    rows = []
+    for row in result.get("rows", []):
+        rows.append(
+            [
+                row["tool"],
+                row["mechanism_fired"],
+                row["evaluated_on_real_session"],
+                format_int_cell(row["token_pressure_before"]),
+                format_int_cell(row["token_spend_with_tool"]),
+                format_percent_cell(row["percent_improvement"]),
+                f"{row['future_session_confidence_percent']}%",
+                row["verdict"],
+            ]
+        )
+    widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
+
+
+def format_int_cell(value: Any) -> str:
+    return "n/a" if value is None else f"{int(value):,}"
+
+
+def format_percent_cell(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):.1f}%"
 
 
 def iter_jsonl(path: Path):
