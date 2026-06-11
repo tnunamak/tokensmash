@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run controlled Codex A/B token benchmarks.
+Run controlled agent A/B token benchmarks.
 
 Primary metric: provider-reported total session tokens per successful task.
 """
@@ -29,7 +29,7 @@ DEFAULT_SUITE = Path(__file__).resolve().parent / "data" / "suites" / "generic" 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="A/B benchmark tokensmashing tools by Codex session-token spend."
+        description="A/B benchmark tokensmashing tools by agent session-token spend."
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -45,7 +45,7 @@ def main() -> int:
     run.add_argument("--variants", help="Comma-separated variant ids to include.")
     run.add_argument("--replicates", type=int, help="Override suite replicate count.")
     run.add_argument("--run-id", help="Stable run id; default is timestamped.")
-    run.add_argument("--timeout", type=float, help="Per Codex run timeout seconds.")
+    run.add_argument("--timeout", type=float, help="Per agent run timeout seconds.")
     run.add_argument("--live", action="store_true", help="Actually spend model quota.")
     run.add_argument("--keep-scratch", action="store_true")
 
@@ -155,10 +155,12 @@ def csv_ids(value: str | None) -> list[str]:
 
 
 def print_plan(suite: dict[str, Any], selection: dict[str, Any]) -> None:
+    agent = suite_agent(suite)
     print(f"suite: {suite.get('name', Path(suite['_suite_path']).name)}")
     print(
-        f"model: {render_env(str(suite.get('model', 'gpt-5.5')))} "
-        f"reasoning={render_env(str(suite.get('reasoning', 'low')))} "
+        f"agent: {agent} "
+        f"model: {suite_model(suite, agent)} "
+        f"effort={suite_effort(suite, agent)} "
         f"sandbox={render_env(str(suite.get('sandbox', 'workspace-write')))}"
     )
     print(f"baseline: {suite['baseline']}")
@@ -171,33 +173,61 @@ def print_plan(suite: dict[str, Any], selection: dict[str, Any]) -> None:
     print("variants")
     enabled_count = 0
     for variant in selection["variants"]:
-        status, why = variant_status(variant)
+        status, why = variant_status(suite, variant)
         if status == "enabled":
             enabled_count += 1
-        print(f"  {variant['id']}: {status}{(' - ' + why) if why else ''}")
+        variant_agent_id = variant_agent(suite, variant)
+        agent_suffix = "" if variant_agent_id == agent else f" [{variant_agent_id}]"
+        print(f"  {variant['id']}{agent_suffix}: {status}{(' - ' + why) if why else ''}")
     print()
     total = len(selection["tasks"]) * enabled_count * selection["replicates"]
-    print(f"live Codex runs if executed: {total}")
+    print(f"live agent runs if executed: {total}")
 
 
-def variant_status(variant: dict[str, Any]) -> tuple[str, str]:
+def variant_status(suite: dict[str, Any], variant: dict[str, Any]) -> tuple[str, str]:
     if variant.get("enabled") is False:
         return "disabled", str(variant.get("disabled_reason") or "enabled=false")
-    missing = missing_requirements(variant.get("requires") or {})
+    missing = missing_requirements(variant.get("requires") or {}, variant_agent(suite, variant))
     if missing:
         return "skipped", "missing " + ", ".join(missing)
     return "enabled", ""
 
 
-def missing_requirements(requires: dict[str, Any]) -> list[str]:
+def missing_requirements(requires: dict[str, Any], agent: str) -> list[str]:
     missing: list[str] = []
+    agents = [str(value).lower() for value in requires.get("agents", []) or []]
+    if agents and agent not in agents:
+        missing.append(f"agent:{agent}")
+    if agent in {"codex", "claude"} and shutil.which(agent) is None:
+        missing.append(f"cmd:{agent}")
     for name in requires.get("env", []) or []:
         if not os.environ.get(str(name)):
             missing.append(f"env:{name}")
     for name in requires.get("commands", []) or []:
-        if shutil.which(str(name)) is None:
-            missing.append(f"cmd:{name}")
+        command = render_env(str(name))
+        if shutil.which(command) is None:
+            missing.append(f"cmd:{command}")
     return missing
+
+
+def suite_agent(suite: dict[str, Any]) -> str:
+    return render_env(str(suite.get("agent") or "codex")).strip().lower()
+
+
+def variant_agent(suite: dict[str, Any], variant: dict[str, Any]) -> str:
+    return render_env(str(variant.get("agent") or suite.get("agent") or "codex")).strip().lower()
+
+
+def suite_model(suite: dict[str, Any], agent: str) -> str:
+    if agent == "claude":
+        return render_env(str(suite.get("claude_model") or suite.get("model") or "sonnet"))
+    return render_env(str(suite.get("model") or "gpt-5.5"))
+
+
+def suite_effort(suite: dict[str, Any], agent: str) -> str:
+    if agent == "claude":
+        return render_env(str(suite.get("claude_effort") or suite.get("reasoning") or "low"))
+    return render_env(str(suite.get("reasoning") or "low"))
 
 
 def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.Namespace) -> Path:
@@ -205,6 +235,7 @@ def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.N
     run_dir = AB_RUNS_DIR / run_id
     require(not run_dir.exists(), f"run dir already exists: {run_dir}")
     run_dir.mkdir(parents=True)
+    agent = suite_agent(suite)
     results: dict[str, Any] = {
         "schema": 1,
         "kind": "tokensmash-ab",
@@ -212,26 +243,28 @@ def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.N
         "suite_path": suite["_suite_path"],
         "suite": scrub_suite(suite),
         "baseline": suite["baseline"],
-        "model": render_env(str(suite.get("model", "gpt-5.5"))),
-        "reasoning": render_env(str(suite.get("reasoning", "low"))),
+        "agent": agent,
+        "model": suite_model(suite, agent),
+        "reasoning": suite_effort(suite, agent),
         "replicates": selection["replicates"],
         "runs": [],
         "notes": [
-            "primary metric is Codex final token_count total_token_usage.total_tokens",
+            "primary metric is provider-reported total session tokens when available",
             "only paired successful task runs are used for improvement percentages",
-            "raw Codex stdout/stderr and last message are stored in the run directory for debugging",
+            "raw agent stdout/stderr and last message are stored in the run directory for debugging",
         ],
     }
     (run_dir / "suite.json").write_text(json.dumps(scrub_suite(suite), indent=2, sort_keys=True) + "\n")
     try:
         for task in selection["tasks"]:
             for variant in selection["variants"]:
-                status, why = variant_status(variant)
+                status, why = variant_status(suite, variant)
                 if status != "enabled":
                     results["runs"].append(
                         {
                             "task_id": task["id"],
                             "variant_id": variant["id"],
+                            "agent": variant_agent(suite, variant),
                             "status": status,
                             "skip_reason": why,
                         }
@@ -260,6 +293,7 @@ def run_one(
     result: dict[str, Any] = {
         "task_id": task["id"],
         "variant_id": variant["id"],
+        "agent": variant_agent(suite, variant),
         "replicate": replicate,
         "status": "running",
         "case_dir": str(case_dir),
@@ -267,16 +301,17 @@ def run_one(
     started = time.time()
     try:
         prepare_repo(task, repo_dir)
-        env = case_env(suite, task, variant, case_dir, repo_dir)
+        agent = variant_agent(suite, variant)
+        env = case_env(suite, task, variant, case_dir, repo_dir, agent)
         run_setup_commands(variant, case_dir, repo_dir, env)
-        prompt = build_prompt(suite, task, variant, case_dir, repo_dir)
+        prompt = build_prompt(suite, task, variant, case_dir, repo_dir, agent)
         prompt_path = case_dir / "prompt.md"
         prompt_path.write_text(prompt)
-        codex_result = run_codex(suite, variant, repo_dir, case_dir, prompt, args.timeout, env)
-        result.update(codex_result)
+        agent_result = run_agent(agent, suite, variant, repo_dir, case_dir, prompt, args.timeout, env)
+        result.update(agent_result)
         result["success_commands"] = run_success_commands(task, repo_dir, env)
         result["success"] = (
-            result.get("codex_exit_code") == 0
+            result.get("agent_exit_code") == 0
             and result.get("token_total") is not None
             and all(cmd["exit_code"] == 0 for cmd in result["success_commands"])
         )
@@ -306,6 +341,7 @@ def case_env(
     variant: dict[str, Any],
     case_dir: Path,
     repo_dir: Path,
+    agent: str,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -320,7 +356,8 @@ def case_env(
     for source in (suite.get("env") or {}, task.get("env") or {}, variant.get("env") or {}):
         for key, value in source.items():
             env[str(key)] = render(str(value), case_dir, repo_dir, variant)
-    prepare_variant_codex_home(variant, case_dir, repo_dir, env)
+    if agent == "codex":
+        prepare_variant_codex_home(variant, case_dir, repo_dir, env)
     return env
 
 
@@ -342,6 +379,10 @@ def prepare_variant_codex_home(
         (codex_home / "config.toml").write_text(render(str(config), case_dir, repo_dir, variant) + "\n")
     if variant.get("codex_hooks") == "context-mode":
         (codex_home / "hooks.json").write_text(json.dumps(context_mode_hooks_json(), indent=2) + "\n")
+    for relative_path, content in (variant.get("codex_home_files") or {}).items():
+        output = codex_home / str(relative_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(render(str(content), case_dir, repo_dir, variant) + "\n")
     env["CODEX_HOME"] = str(codex_home)
 
 
@@ -350,7 +391,7 @@ def context_mode_hooks_json() -> dict[str, Any]:
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "local_shell|shell|shell_command|exec_command|container.exec|Bash|Shell|grep_files",
+                    "matcher": "local_shell|shell|shell_command|exec_command|container.exec|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__",
                     "hooks": [{"type": "command", "command": "context-mode hook codex pretooluse"}],
                 }
             ],
@@ -359,6 +400,9 @@ def context_mode_hooks_json() -> dict[str, Any]:
             ],
             "SessionStart": [
                 {"hooks": [{"type": "command", "command": "context-mode hook codex sessionstart"}]}
+            ],
+            "PreCompact": [
+                {"hooks": [{"type": "command", "command": "context-mode hook codex precompact"}]}
             ],
             "UserPromptSubmit": [
                 {"hooks": [{"type": "command", "command": "context-mode hook codex userpromptsubmit"}]}
@@ -382,9 +426,10 @@ def build_prompt(
     variant: dict[str, Any],
     case_dir: Path,
     repo_dir: Path,
+    agent: str,
 ) -> str:
-    prefix = render(str(variant.get("prompt_prefix") or ""), case_dir, repo_dir, variant).strip()
-    suffix = render(str(variant.get("prompt_suffix") or ""), case_dir, repo_dir, variant).strip()
+    prefix = render(variant_prompt_text(variant, agent, "prompt_prefix"), case_dir, repo_dir, variant).strip()
+    suffix = render(variant_prompt_text(variant, agent, "prompt_suffix"), case_dir, repo_dir, variant).strip()
     success = "\n".join(f"- `{render_env(str(cmd))}`" for cmd in task.get("success_commands", []) or [])
     parts = []
     if prefix:
@@ -409,6 +454,41 @@ def build_prompt(
     return "\n\n".join(parts) + "\n"
 
 
+def variant_prompt_text(variant: dict[str, Any], agent: str, key: str) -> str:
+    specific = variant.get(f"{agent}_{key}")
+    if specific is not None:
+        return str(specific)
+    return str(variant.get(key) or "")
+
+
+def run_agent(
+    agent: str,
+    suite: dict[str, Any],
+    variant: dict[str, Any],
+    repo_dir: Path,
+    case_dir: Path,
+    prompt: str,
+    timeout_override: float | None,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    if agent == "codex":
+        return run_codex(suite, variant, repo_dir, case_dir, prompt, timeout_override, env)
+    if agent == "claude":
+        return run_claude(suite, variant, repo_dir, case_dir, prompt, timeout_override, env)
+    raise RuntimeError(f"unsupported agent: {agent}")
+
+
+def agent_command(agent: str, variant: dict[str, Any], args: list[str]) -> list[str]:
+    wrapper = variant.get(f"{agent}_wrapper") or variant.get("agent_wrapper")
+    if wrapper:
+        if isinstance(wrapper, str):
+            wrapper_args = [wrapper]
+        else:
+            wrapper_args = [str(part) for part in wrapper]
+        return [*wrapper_args, "--", *args]
+    return [agent, *args]
+
+
 def run_codex(
     suite: dict[str, Any],
     variant: dict[str, Any],
@@ -422,11 +502,10 @@ def run_codex(
     stderr_path = case_dir / "codex.stderr"
     last_message_path = case_dir / "last-message.md"
     timeout = timeout_override or float(suite.get("timeout_seconds") or 1800)
-    model = render_env(str(suite.get("model") or "gpt-5.5"))
-    reasoning = render_env(str(suite.get("reasoning") or "low"))
+    model = suite_model(suite, "codex")
+    reasoning = suite_effort(suite, "codex")
     sandbox = render_env(str(suite.get("sandbox") or "workspace-write"))
-    cmd = [
-        "codex",
+    codex_args = [
         "-a",
         "never",
         "-s",
@@ -445,6 +524,7 @@ def run_codex(
         *[str(arg) for arg in variant.get("codex_args", []) or []],
         prompt,
     ]
+    cmd = agent_command("codex", variant, codex_args)
     start_time = time.time()
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         try:
@@ -474,6 +554,14 @@ def run_codex(
     session_path = find_codex_session(session_id, repo_dir, start_time, env)
     usage = extract_codex_usage(session_path) if session_path else {}
     return {
+        "agent": "codex",
+        "model": model,
+        "reasoning": reasoning,
+        "agent_command": shell_join_redacted(cmd),
+        "agent_exit_code": exit_code,
+        "agent_timed_out": timed_out,
+        "agent_stdout": file_metrics(stdout_path),
+        "agent_stderr": file_metrics(stderr_path),
         "codex_command": shell_join_redacted(cmd),
         "codex_exit_code": exit_code,
         "codex_timed_out": timed_out,
@@ -485,6 +573,94 @@ def run_codex(
         "token_source": "codex:final_token_count" if usage else "missing",
         "token_total": usage.get("total_tokens"),
         "token_usage": usage,
+    }
+
+
+def run_claude(
+    suite: dict[str, Any],
+    variant: dict[str, Any],
+    repo_dir: Path,
+    case_dir: Path,
+    prompt: str,
+    timeout_override: float | None,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    stdout_path = case_dir / "claude.stdout"
+    stderr_path = case_dir / "claude.stderr"
+    timeout = timeout_override or float(suite.get("timeout_seconds") or 1800)
+    model = suite_model(suite, "claude")
+    effort = suite_effort(suite, "claude")
+    claude_args = [
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--effort",
+        effort,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+    budget = (
+        variant.get("claude_max_budget_usd")
+        or suite.get("claude_max_budget_usd")
+        or os.environ.get("TOKENSMASH_MAX_BUDGET_USD")
+    )
+    if budget is not None:
+        budget = render_env(str(budget))
+    if budget:
+        claude_args.extend(["--max-budget-usd", str(budget)])
+    mcp_config = variant.get("claude_mcp_config")
+    if mcp_config:
+        mcp_path = case_dir / "claude-mcp.json"
+        mcp_path.write_text(render_json_config(mcp_config, case_dir, repo_dir, variant))
+        claude_args.extend(["--mcp-config", str(mcp_path), "--strict-mcp-config"])
+    settings = variant.get("claude_settings")
+    if settings:
+        settings_path = case_dir / "claude-settings.json"
+        settings_path.write_text(render_json_config(settings, case_dir, repo_dir, variant))
+        claude_args.extend(["--settings", str(settings_path)])
+    claude_args.extend(str(arg) for arg in variant.get("claude_args", []) or [])
+    cmd = agent_command("claude", variant, claude_args)
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=repo_dir,
+                env=env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                timeout=timeout,
+                check=False,
+            )
+            exit_code = proc.returncode
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            exit_code = None
+            timed_out = True
+    payload, parse_error = parse_json_object(read_tail(stdout_path, size=200000))
+    usage = extract_claude_usage(payload) if payload else {}
+    return {
+        "agent": "claude",
+        "model": model,
+        "reasoning": effort,
+        "agent_command": shell_join_redacted(cmd),
+        "agent_exit_code": exit_code,
+        "agent_timed_out": timed_out,
+        "agent_stdout": file_metrics(stdout_path),
+        "agent_stderr": file_metrics(stderr_path),
+        "claude_command": shell_join_redacted(cmd),
+        "claude_exit_code": exit_code,
+        "claude_timed_out": timed_out,
+        "claude_stdout": file_metrics(stdout_path),
+        "claude_stderr": file_metrics(stderr_path),
+        "session_id": payload.get("session_id") if payload else None,
+        "token_source": "claude:stdout_usage" if usage else "missing",
+        "token_total": usage.get("total_tokens"),
+        "token_usage": usage,
+        "total_cost_usd": payload.get("total_cost_usd") if payload else None,
+        "result_json_error": parse_error,
     }
 
 
@@ -524,6 +700,28 @@ def render(template: str, case_dir: Path, repo_dir: Path, variant: dict[str, Any
     )
 
 
+def render_json_config(value: Any, case_dir: Path, repo_dir: Path, variant: dict[str, Any]) -> str:
+    if isinstance(value, str):
+        rendered = render(value, case_dir, repo_dir, variant)
+        try:
+            parsed = json.loads(rendered)
+        except json.JSONDecodeError:
+            return rendered + "\n"
+        return json.dumps(parsed, indent=2, sort_keys=True) + "\n"
+    rendered = render_config_value(value, case_dir, repo_dir, variant)
+    return json.dumps(rendered, indent=2, sort_keys=True) + "\n"
+
+
+def render_config_value(value: Any, case_dir: Path, repo_dir: Path, variant: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        return render(value, case_dir, repo_dir, variant)
+    if isinstance(value, list):
+        return [render_config_value(item, case_dir, repo_dir, variant) for item in value]
+    if isinstance(value, dict):
+        return {str(key): render_config_value(child, case_dir, repo_dir, variant) for key, child in value.items()}
+    return value
+
+
 def render_env(value: str) -> str:
     pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
@@ -537,6 +735,39 @@ def render_env(value: str) -> str:
         return match.group(0)
 
     return pattern.sub(replace, value)
+
+
+def parse_json_object(text: str) -> tuple[dict[str, Any] | None, str | None]:
+    for line in reversed(text.splitlines()):
+        candidate = line.strip()
+        if not candidate.startswith("{") or not candidate.endswith("}"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            return None, str(exc)
+        if isinstance(payload, dict):
+            return payload, None
+    return None, "no JSON object found in stdout"
+
+
+def extract_claude_usage(payload: dict[str, Any]) -> dict[str, int]:
+    raw = payload.get("usage")
+    if not isinstance(raw, dict):
+        return {}
+    input_tokens = int(raw.get("input_tokens") or 0)
+    cache_creation = int(raw.get("cache_creation_input_tokens") or 0)
+    cache_read = int(raw.get("cache_read_input_tokens") or 0)
+    output_tokens = int(raw.get("output_tokens") or 0)
+    total = input_tokens + cache_creation + cache_read + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": cache_creation,
+        "cached_input_tokens": cache_read,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": 0,
+        "total_tokens": total,
+    }
 
 
 def run_checked(
@@ -992,13 +1223,14 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
         "",
         "## Summary",
         "",
-        "Primary metric: Codex provider-reported `total_token_usage.total_tokens` per successful task run.",
+        "Primary metric: provider-reported total session tokens per successful task run.",
         "Each row uses the paired baseline from the same result batch, task, and replicate.",
         "",
         markdown_table(
             [
                 "tool",
                 "how applied",
+                "agent",
                 "baseline tokens",
                 "tool tokens",
                 "token result",
@@ -1012,6 +1244,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                 [
                     row["tool"],
                     row["tool_label"],
+                    row["agent"],
                     str(row["baseline_tokens"]),
                     str(row["tool_tokens"]),
                     pct_improvement(row["baseline_tokens"], row["tool_tokens"]),
@@ -1063,13 +1296,13 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
             "",
             "## Result Files",
             "",
-            *[f"- `{row['result_file']}`" for row in rows],
+            *[f"- `{path}`" for path in unique_nonempty(row["result_file"] for row in rows)],
             "",
             "## Limitations",
             "",
             "- One task and one replicate per row; use directionally, not as a confidence interval.",
             "- Rows from different result batches have different paired baselines; compare each row to its own baseline.",
-            "- This measures Codex CLI behavior only, not Claude/Gemini or non-coding research sessions.",
+            "- Agent integrations differ: hook/proxy/MCP rows are not interchangeable across Codex, Claude, Gemini, or non-coding research sessions.",
             "- Tool exposure is not always tool use; inspect session logs before making global defaults from a row.",
         ]
     )
@@ -1099,6 +1332,7 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if not baseline:
                 continue
             task = tasks.get(task_id, {})
+            oracle_commands = run.get("success_commands") or baseline.get("success_commands") or []
             rows.append(
                 {
                     "tool": variant_id,
@@ -1107,12 +1341,13 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "tool_tokens": int(run.get("token_total") or 0),
                     "baseline_usage": baseline.get("token_usage") or {},
                     "tool_usage": run.get("token_usage") or {},
-                    "model": str(results.get("model") or ""),
-                    "reasoning": str(results.get("reasoning") or ""),
+                    "agent": str(run.get("agent") or results.get("agent") or "codex"),
+                    "model": str(run.get("model") or results.get("model") or ""),
+                    "reasoning": str(run.get("reasoning") or results.get("reasoning") or ""),
                     "task_id": task_id,
                     "repo": str(task.get("repo") or ""),
                     "base_ref": str(task.get("base_ref") or ""),
-                    "oracle": ", ".join(str(cmd) for cmd in task.get("success_commands", []) or []) or "none",
+                    "oracle": format_oracle(oracle_commands, task),
                     "result": "pass" if run.get("success") else "fail",
                     "duration_ms": int(run.get("duration_ms") or 0),
                     "result_file": str(resolve_results_path(Path(results.get("_path", ""))) if results.get("_path") else ""),
@@ -1125,6 +1360,7 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def evaluation_card(results_list: list[dict[str, Any]]) -> dict[str, str]:
     suite_names = sorted({str((r.get("suite") or {}).get("name") or "") for r in results_list})
+    agents = sorted({str(r.get("agent") or "codex") for r in results_list})
     models = sorted({str(r.get("model") or "") for r in results_list})
     reasoning = sorted({str(r.get("reasoning") or "") for r in results_list})
     tasks = []
@@ -1139,7 +1375,7 @@ def evaluation_card(results_list: list[dict[str, Any]]) -> dict[str, str]:
             oracles.extend(str(cmd) for cmd in task.get("success_commands", []) or [])
     return {
         "suite": ", ".join(unique_nonempty(suite_names)),
-        "agent": "Codex CLI",
+        "agent": ", ".join(unique_nonempty(agents)),
         "model": ", ".join(unique_nonempty(models)),
         "reasoning effort": ", ".join(unique_nonempty(reasoning)),
         "tasks": ", ".join(unique_nonempty(tasks)),
@@ -1149,6 +1385,20 @@ def evaluation_card(results_list: list[dict[str, Any]]) -> dict[str, str]:
         "replicates": "1 per row",
         "sandbox": "workspace-write",
     }
+
+
+def format_oracle(commands: Any, task: dict[str, Any]) -> str:
+    if isinstance(commands, list) and commands:
+        values = []
+        for command in commands:
+            if isinstance(command, dict):
+                values.append(str(command.get("command") or ""))
+            else:
+                values.append(str(command))
+        rendered = ", ".join(unique_nonempty(values))
+        if rendered:
+            return rendered
+    return ", ".join(str(cmd) for cmd in task.get("success_commands", []) or []) or "none"
 
 
 def markdown_table(headers: list[str], rows: list[list[str]]) -> str:

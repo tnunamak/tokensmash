@@ -2,8 +2,12 @@
   "schema": 1,
   "name": "generic-agent-tool-comparison",
   "baseline": "baseline_no_user_config",
+  "agent": "${TOKENSMASH_AGENT:-codex}",
   "model": "${TOKENSMASH_MODEL:-gpt-5.5}",
+  "claude_model": "${TOKENSMASH_CLAUDE_MODEL:-sonnet}",
   "reasoning": "${TOKENSMASH_REASONING:-low}",
+  "claude_effort": "${TOKENSMASH_CLAUDE_EFFORT:-low}",
+  "claude_max_budget_usd": "${TOKENSMASH_MAX_BUDGET_USD:-}",
   "sandbox": "workspace-write",
   "replicates": 1,
   "timeout_seconds": 1800,
@@ -33,18 +37,91 @@
       "codex_args": [
         "--ignore-user-config",
         "--ignore-rules"
+      ],
+      "claude_args": [
+        "--safe-mode"
       ]
     },
     {
       "id": "context_mode",
-      "label": "context-mode MCP plus Codex lifecycle hooks",
+      "label": "context-mode MCP plus lifecycle hooks",
       "codex_home": true,
-      "codex_config": "[features]\nhooks = true\n\n[mcp_servers.context-mode]\ncommand = \"context-mode\"",
+      "codex_config": "[features]\nhooks = true\n\n[mcp_servers.context-mode]\ncommand = \"context-mode\"\n[mcp_servers.context-mode.env]\nCONTEXT_MODE_PLATFORM = \"codex\"",
       "codex_hooks": "context-mode",
       "codex_args": [
         "--ignore-rules",
         "--dangerously-bypass-hook-trust"
       ],
+      "claude_mcp_config": {
+        "mcpServers": {
+          "context-mode": {
+            "command": "context-mode",
+            "env": {
+              "CONTEXT_MODE_PLATFORM": "claude-code"
+            }
+          }
+        }
+      },
+      "claude_settings": {
+        "hooks": {
+          "PreToolUse": [
+            {
+              "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "context-mode hook claude-code pretooluse"
+                }
+              ]
+            }
+          ],
+          "PostToolUse": [
+            {
+              "matcher": "Bash|Read|Write|Edit|Glob|Grep|TodoWrite|Agent|mcp__",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "context-mode hook claude-code posttooluse"
+                }
+              ]
+            }
+          ],
+          "SessionStart": [
+            {
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "context-mode hook claude-code sessionstart"
+                }
+              ]
+            }
+          ],
+          "PreCompact": [
+            {
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "context-mode hook claude-code precompact"
+                }
+              ]
+            }
+          ],
+          "UserPromptSubmit": [
+            {
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "context-mode hook claude-code userpromptsubmit"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "prompt_prefix": "Use context-mode sandbox/MCP tools for repository discovery, broad search, web fetches, and large command outputs. Return only concise derived answers to the chat.",
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -58,13 +135,20 @@
     },
     {
       "id": "headroom",
-      "label": "Headroom MCP exposed to Codex",
+      "label": "Headroom wrap proxy for automatic request compression",
       "codex_home": true,
-      "codex_config": "[features]\nhooks = false\n\n[mcp_servers.headroom]\ncommand = \"headroom\"",
-      "codex_args": [
-        "--ignore-rules"
+      "codex_wrapper": [
+        "headroom",
+        "wrap",
+        "codex",
+        "--no-serena"
       ],
-      "prompt_prefix": "Use the Headroom MCP tools if they would reduce repository discovery or retained context. Do not use them if they do not help this task.",
+      "claude_wrapper": [
+        "headroom",
+        "wrap",
+        "claude",
+        "--no-serena"
+      ],
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -78,12 +162,29 @@
     },
     {
       "id": "rtk",
-      "label": "RTK shell-output reducers by instruction",
-      "codex_args": [
-        "--ignore-user-config",
-        "--ignore-rules"
-      ],
-      "prompt_prefix": "When running shell commands, prefer RTK wrappers where they preserve semantics and reduce output, for example `rtk go test ./...`, `rtk grep`, `rtk find`, and `rtk git`.",
+      "label": "RTK Claude hook or Codex AGENTS/RTK instructions",
+      "codex_home": true,
+      "codex_home_files": {
+        "AGENTS.md": "@RTK.md",
+        "RTK.md": "# RTK - Rust Token Killer (Codex CLI)\n\nAlways prefix shell commands with `rtk --ultra-compact` when the wrapper preserves command semantics. Prefer `rtk git`, `rtk grep`, `rtk find`, `rtk go test`, `rtk npm`, `rtk pytest`, and `rtk test` over raw high-output commands.\n\nUse `rtk proxy <cmd>` only when full raw output is required."
+      },
+      "codex_prompt_prefix": "RTK is installed. Follow the RTK.md rule from the isolated Codex home: prefer `rtk --ultra-compact` wrappers for shell commands whenever semantics are preserved.",
+      "claude_settings": {
+        "hooks": {
+          "PreToolUse": [
+            {
+              "matcher": "Bash",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "rtk hook claude --ultra-compact"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "claude_prompt_prefix": "RTK's Claude hook rewrites Bash commands only. Prefer Bash/shell commands over built-in Read/Grep/Glob when that preserves correctness, so RTK can compact the output.",
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -97,7 +198,7 @@
     },
     {
       "id": "semmap",
-      "label": "SEMMAP architecture map before editing",
+      "label": "SEMMAP chat map before source reads",
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -107,13 +208,32 @@
         ]
       },
       "setup_commands": [
-        "\"$SEMMAP_BIN\" generate --root \"{repo_dir}\" --output \"{run_dir}/SEMMAP.md\""
+        "\"$SEMMAP_BIN\" generate --root \"{repo_dir}\" --chat-output \"{run_dir}/SEMMAP.md\" || \"$SEMMAP_BIN\" generate --root \"{repo_dir}\" --output \"{run_dir}/SEMMAP.md\""
       ],
-      "prompt_prefix": "Before searching broadly, inspect the generated SEMMAP at {run_dir}/SEMMAP.md and use it to choose the smallest set of files to read."
+      "codex_args": [
+        "--ignore-user-config",
+        "--ignore-rules"
+      ],
+      "prompt_prefix": "Before searching broadly or reading source files, inspect {run_dir}/SEMMAP.md, identify a minimal working set, and then read only the files needed for the task. If the installed SEMMAP supports trace/cat commands, use them to narrow the working set."
     },
     {
       "id": "repomix",
-      "label": "Repomix repository pack before editing",
+      "label": "Repomix MCP incremental repository packing",
+      "codex_home": true,
+      "codex_config": "[mcp_servers.repomix]\ncommand = \"npx\"\nargs = [\"--yes\", \"repomix@latest\", \"--mcp\"]",
+      "claude_mcp_config": {
+        "mcpServers": {
+          "repomix": {
+            "command": "npx",
+            "args": [
+              "--yes",
+              "repomix@latest",
+              "--mcp"
+            ]
+          }
+        }
+      },
+      "prompt_prefix": "Use Repomix MCP incrementally: pack only task-relevant paths with focused include/ignore patterns, then grep or retrieve slices from the packed output. Do not read a full-repo pack into chat unless the task truly requires it.",
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -123,29 +243,30 @@
         "commands": [
           "npx"
         ]
-      },
-      "setup_commands": [
-        "npx --yes repomix@latest \"{repo_dir}\" --output \"{run_dir}/repomix.md\""
-      ],
-      "prompt_prefix": "A Repomix pack is available at {run_dir}/repomix.md. Use it only if it helps avoid broader repo discovery."
+      }
     },
     {
       "id": "gitingest",
-      "label": "Gitingest repository digest before editing",
+      "label": "Gitingest focused digest from explicit include patterns",
       "requires": {
         "env": [
           "TARGET_REPO",
           "TARGET_PROMPT",
-          "TARGET_TEST_COMMAND"
+          "TARGET_TEST_COMMAND",
+          "TARGET_CONTEXT_INCLUDE"
         ],
         "commands": [
           "uvx"
         ]
       },
       "setup_commands": [
-        "uvx gitingest \"{repo_dir}\" -o \"{run_dir}/gitingest.txt\""
+        "if [ -n \"$TARGET_CONTEXT_EXCLUDE\" ]; then uvx gitingest \"{repo_dir}\" --include-pattern \"$TARGET_CONTEXT_INCLUDE\" --exclude-pattern \"$TARGET_CONTEXT_EXCLUDE\" -o \"{run_dir}/gitingest.txt\"; else uvx gitingest \"{repo_dir}\" --include-pattern \"$TARGET_CONTEXT_INCLUDE\" -o \"{run_dir}/gitingest.txt\"; fi"
       ],
-      "prompt_prefix": "A Gitingest digest is available at {run_dir}/gitingest.txt. Use it only if it helps avoid broader repo discovery."
+      "codex_args": [
+        "--ignore-user-config",
+        "--ignore-rules"
+      ],
+      "prompt_prefix": "A focused Gitingest digest is available at {run_dir}/gitingest.txt. Use it as the orientation artifact before reading source files, and then inspect only the minimal source files needed for the task."
     }
   ]
 }
