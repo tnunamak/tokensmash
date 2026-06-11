@@ -122,6 +122,13 @@
         }
       },
       "prompt_prefix": "Use context-mode sandbox/MCP tools for repository discovery, broad search, web fetches, and large command outputs. Return only concise derived answers to the chat.",
+      "mechanism_checks": [
+        {
+          "type": "session_tool_regex",
+          "label": "context-mode tool call",
+          "pattern": "mcp__context|ctx_"
+        }
+      ],
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -148,6 +155,22 @@
         "wrap",
         "claude",
         "--no-serena"
+      ],
+      "codex_mechanism_checks": [
+        {
+          "type": "file_regex",
+          "label": "Headroom routed requests",
+          "path": "{run_dir}/codex.stdout",
+          "pattern": "(?:routed[^0-9\\n]{0,40}[1-9][0-9]*|[1-9][0-9]*[^\\n]{0,80}routed)"
+        }
+      ],
+      "claude_mechanism_checks": [
+        {
+          "type": "file_regex",
+          "label": "Headroom routed requests",
+          "path": "{run_dir}/claude.stdout",
+          "pattern": "(?:routed[^0-9\\n]{0,40}[1-9][0-9]*|[1-9][0-9]*[^\\n]{0,80}routed)"
+        }
       ],
       "requires": {
         "env": [
@@ -185,6 +208,13 @@
         }
       },
       "claude_prompt_prefix": "RTK's Claude hook rewrites Bash commands only. Prefer Bash/shell commands over built-in Read/Grep/Glob when that preserves correctness, so RTK can compact the output.",
+      "mechanism_checks": [
+        {
+          "type": "session_tool_regex",
+          "label": "RTK command or hook execution",
+          "pattern": "\\brtk\\b"
+        }
+      ],
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -214,6 +244,19 @@
         "--ignore-user-config",
         "--ignore-rules"
       ],
+      "mechanism_checks": [
+        {
+          "type": "file_min_bytes",
+          "label": "SEMMAP artifact generated",
+          "path": "{run_dir}/SEMMAP.md",
+          "min_bytes": 200
+        },
+        {
+          "type": "session_tool_regex",
+          "label": "SEMMAP artifact used by agent",
+          "pattern": "SEMMAP\\.md|semmap"
+        }
+      ],
       "prompt_prefix": "Before searching broadly or reading source files, inspect {run_dir}/SEMMAP.md, identify a minimal working set, and then read only the files needed for the task. If the installed SEMMAP supports trace/cat commands, use them to narrow the working set."
     },
     {
@@ -234,6 +277,13 @@
         }
       },
       "prompt_prefix": "Use Repomix MCP incrementally: pack only task-relevant paths with focused include/ignore patterns, then grep or retrieve slices from the packed output. Do not read a full-repo pack into chat unless the task truly requires it.",
+      "mechanism_checks": [
+        {
+          "type": "session_tool_regex",
+          "label": "Repomix MCP tool call",
+          "pattern": "repomix|pack_codebase|grep_repomix_output"
+        }
+      ],
       "requires": {
         "env": [
           "TARGET_REPO",
@@ -265,6 +315,19 @@
       "codex_args": [
         "--ignore-user-config",
         "--ignore-rules"
+      ],
+      "mechanism_checks": [
+        {
+          "type": "file_min_bytes",
+          "label": "Gitingest artifact generated",
+          "path": "{run_dir}/gitingest.txt",
+          "min_bytes": 200
+        },
+        {
+          "type": "session_tool_regex",
+          "label": "Gitingest artifact used by agent",
+          "pattern": "gitingest\\.txt|gitingest"
+        }
       ],
       "prompt_prefix": "A focused Gitingest digest is available at {run_dir}/gitingest.txt. Use it as the orientation artifact before reading source files, and then inspect only the minimal source files needed for the task."
     }

@@ -23,6 +23,7 @@ from typing import Any
 STATE_DIR = Path.home() / ".local" / "state" / "tokensmash"
 AB_RUNS_DIR = STATE_DIR / "ab-runs"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SUITE = Path(__file__).resolve().parent / "data" / "suites" / "generic" / "tool-comparison.json"
 
@@ -309,6 +310,7 @@ def run_one(
         prompt_path.write_text(prompt)
         agent_result = run_agent(agent, suite, variant, repo_dir, case_dir, prompt, args.timeout, env)
         result.update(agent_result)
+        result["mechanism_checks"] = run_mechanism_checks(variant, case_dir, repo_dir, result)
         result["success_commands"] = run_success_commands(task, repo_dir, env)
         result["success"] = (
             result.get("agent_exit_code") == 0
@@ -623,6 +625,7 @@ def run_claude(
         claude_args.extend(["--settings", str(settings_path)])
     claude_args.extend(str(arg) for arg in variant.get("claude_args", []) or [])
     cmd = agent_command("claude", variant, claude_args)
+    start_time = time.time()
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         try:
             proc = subprocess.run(
@@ -641,6 +644,8 @@ def run_claude(
             timed_out = True
     payload, parse_error = parse_json_object(read_tail(stdout_path, size=200000))
     usage = extract_claude_usage(payload) if payload else {}
+    session_id = payload.get("session_id") if payload else None
+    session_path = find_claude_session(str(session_id) if session_id else None, repo_dir, start_time, env)
     return {
         "agent": "claude",
         "model": model,
@@ -655,7 +660,8 @@ def run_claude(
         "claude_timed_out": timed_out,
         "claude_stdout": file_metrics(stdout_path),
         "claude_stderr": file_metrics(stderr_path),
-        "session_id": payload.get("session_id") if payload else None,
+        "session_id": session_id,
+        "session_path": str(session_path) if session_path else None,
         "token_source": "claude:stdout_usage" if usage else "missing",
         "token_total": usage.get("total_tokens"),
         "token_usage": usage,
@@ -690,6 +696,157 @@ def run_success_commands(task: dict[str, Any], repo_dir: Path, env: dict[str, st
             }
         )
     return out
+
+
+def run_mechanism_checks(
+    variant: dict[str, Any],
+    case_dir: Path,
+    repo_dir: Path,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    agent = str(result.get("agent") or "")
+    checks = variant.get(f"{agent}_mechanism_checks") or variant.get("mechanism_checks") or []
+    if not checks:
+        return {"required": False, "ok": True, "checks": []}
+    evidence = []
+    for check in checks:
+        if not isinstance(check, dict):
+            evidence.append({"ok": False, "error": "mechanism check must be an object"})
+            continue
+        evidence.append(run_mechanism_check(check, case_dir, repo_dir, result))
+    return {
+        "required": True,
+        "ok": bool(evidence) and all(item.get("ok") for item in evidence),
+        "checks": evidence,
+    }
+
+
+def run_mechanism_check(
+    check: dict[str, Any],
+    case_dir: Path,
+    repo_dir: Path,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    typ = str(check.get("type") or "")
+    label = str(check.get("label") or typ)
+    if typ == "file_min_bytes":
+        path = resolve_check_path(check, case_dir, repo_dir, result)
+        minimum = int(check.get("min_bytes") or 1)
+        actual = path.stat().st_size if path.exists() else 0
+        return {"label": label, "type": typ, "ok": actual >= minimum, "path": str(path), "bytes": actual}
+    if typ == "file_regex":
+        path = resolve_check_path(check, case_dir, repo_dir, result)
+        pattern = str(check.get("pattern") or "")
+        text = read_bounded(path, int(check.get("max_bytes") or 2_000_000))
+        match_count = len(re.findall(pattern, text, flags=re.IGNORECASE | re.MULTILINE)) if pattern else 0
+        minimum = int(check.get("min_matches") or 1)
+        return {
+            "label": label,
+            "type": typ,
+            "ok": match_count >= minimum,
+            "path": str(path),
+            "matches": match_count,
+        }
+    if typ == "session_regex":
+        path_value = result.get("session_path")
+        path = Path(str(path_value)).expanduser() if path_value else Path()
+        pattern = str(check.get("pattern") or "")
+        text = read_bounded(path, int(check.get("max_bytes") or 5_000_000)) if path_value else ""
+        match_count = len(re.findall(pattern, text, flags=re.IGNORECASE | re.MULTILINE)) if pattern else 0
+        minimum = int(check.get("min_matches") or 1)
+        return {
+            "label": label,
+            "type": typ,
+            "ok": bool(path_value) and match_count >= minimum,
+            "path": str(path) if path_value else "",
+            "matches": match_count,
+        }
+    if typ == "session_tool_regex":
+        path_value = result.get("session_path")
+        path = Path(str(path_value)).expanduser() if path_value else Path()
+        pattern = str(check.get("pattern") or "")
+        text = session_tool_text(path) if path_value else ""
+        match_count = len(re.findall(pattern, text, flags=re.IGNORECASE | re.MULTILINE)) if pattern else 0
+        minimum = int(check.get("min_matches") or 1)
+        return {
+            "label": label,
+            "type": typ,
+            "ok": bool(path_value) and match_count >= minimum,
+            "path": str(path) if path_value else "",
+            "matches": match_count,
+        }
+    if typ == "json_number_gte":
+        path = resolve_check_path(check, case_dir, repo_dir, result)
+        key_path = str(check.get("key") or "")
+        minimum = float(check.get("min") or 0)
+        value = json_number_at(path, key_path)
+        return {
+            "label": label,
+            "type": typ,
+            "ok": value is not None and value >= minimum,
+            "path": str(path),
+            "key": key_path,
+            "value": value,
+            "min": minimum,
+        }
+    return {"label": label, "type": typ, "ok": False, "error": f"unknown mechanism check type: {typ}"}
+
+
+def session_tool_text(path: Path) -> str:
+    chunks: list[str] = []
+    for obj in iter_jsonl(path):
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
+        if not isinstance(payload, dict):
+            continue
+        typ = str(payload.get("type") or obj.get("type") or "")
+        if typ in {"function_call", "custom_tool_call", "mcp_tool_call_begin", "mcp_tool_call_end"}:
+            chunks.append(json.dumps(payload, separators=(",", ":")))
+            continue
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                tool_items = [
+                    item
+                    for item in content
+                    if isinstance(item, dict) and str(item.get("type") or "") in {"tool_use", "tool_result"}
+                ]
+                if tool_items:
+                    chunks.append(json.dumps(tool_items, separators=(",", ":")))
+    return "\n".join(chunks)
+
+
+def resolve_check_path(check: dict[str, Any], case_dir: Path, repo_dir: Path, result: dict[str, Any]) -> Path:
+    value = str(check.get("path") or "")
+    if value == "{session_path}":
+        session_path = result.get("session_path")
+        return Path(str(session_path)).expanduser() if session_path else Path()
+    rendered = render(value, case_dir, repo_dir, {"id": result.get("variant_id")})
+    path = Path(rendered).expanduser()
+    return path if path.is_absolute() else case_dir / path
+
+
+def read_bounded(path: Path, max_bytes: int) -> str:
+    if not path or not path.exists():
+        return ""
+    with path.open("rb") as handle:
+        return handle.read(max_bytes).decode("utf-8", "replace")
+
+
+def json_number_at(path: Path, key_path: str) -> float | None:
+    if not path.exists():
+        return None
+    try:
+        value: Any = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    for part in key_path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
 
 
 def render(template: str, case_dir: Path, repo_dir: Path, variant: dict[str, Any]) -> str:
@@ -826,6 +983,38 @@ def find_codex_session(
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def find_claude_session(
+    session_id: str | None,
+    repo_dir: Path,
+    start_time: float,
+    env: dict[str, str],
+) -> Path | None:
+    roots = claude_session_roots(env)
+    if session_id:
+        matches = []
+        for root in roots:
+            matches.extend(root.glob(f"**/{session_id}.jsonl"))
+        if matches:
+            return max(matches, key=lambda path: path.stat().st_mtime)
+    encoded = claude_project_dir_name(repo_dir)
+    candidates = []
+    cutoff = start_time - 5
+    for root in roots:
+        project_dir = root / encoded
+        search_roots = [project_dir] if project_dir.exists() else [root]
+        for search_root in search_roots:
+            for path in search_root.glob("**/*.jsonl"):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        continue
+                except OSError:
+                    continue
+                candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
 def session_roots(env: dict[str, str]) -> list[Path]:
     roots = []
     configured = env.get("CODEX_HOME")
@@ -840,6 +1029,26 @@ def session_roots(env: dict[str, str]) -> list[Path]:
             unique.append(root)
             seen.add(key)
     return unique
+
+
+def claude_session_roots(env: dict[str, str]) -> list[Path]:
+    roots = []
+    configured = env.get("CLAUDE_PROJECTS_DIR")
+    if configured:
+        roots.append(Path(configured))
+    roots.append(CLAUDE_PROJECTS_DIR)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen and root.exists():
+            unique.append(root)
+            seen.add(key)
+    return unique
+
+
+def claude_project_dir_name(path: Path) -> str:
+    return str(path.resolve()).replace("/", "-")
 
 
 def session_cwd(path: Path) -> str | None:
@@ -1165,7 +1374,7 @@ def resolve_results_path(path: Path) -> Path:
 def print_table(results: dict[str, Any]) -> None:
     baseline_id = str(results["baseline"])
     rows = comparison_rows(results, baseline_id)
-    headers = ["tool", "baseline token spend", "token spend with tool", "percent improvement"]
+    headers = ["tool", "baseline token spend", "token spend with tool", "percent improvement", "mechanism"]
     widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * widths[i] for i in range(len(headers))))
@@ -1193,11 +1402,15 @@ def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]
             continue
         base_total = 0
         tool_total = 0
-        pairs = 0
+        measured_pairs = 0
+        invalid_pairs = 0
         for by_variant in grouped.values():
             base = by_variant.get(baseline_id)
             tool = by_variant.get(variant_id)
             if not base or not tool:
+                continue
+            if not mechanism_observed(tool, baseline_id):
+                invalid_pairs += 1
                 continue
             base_tokens = base.get("token_total")
             tool_tokens = tool.get("token_total")
@@ -1205,12 +1418,38 @@ def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]
                 continue
             base_total += int(base_tokens)
             tool_total += int(tool_tokens)
-            pairs += 1
-        if pairs == 0:
-            rows.append([variant_id, "n/a", "n/a", "n/a"])
+            measured_pairs += 1
+        if measured_pairs == 0 and invalid_pairs == 0:
+            rows.append([variant_id, "n/a", "n/a", "n/a", "not observed"])
+        elif measured_pairs == 0:
+            rows.append([variant_id, "not reported", "not reported", "not measured", "not observed"])
+        elif invalid_pairs:
+            rows.append([variant_id, str(base_total), str(tool_total), pct_improvement(base_total, tool_total), "partially observed"])
         else:
-            rows.append([variant_id, str(base_total), str(tool_total), pct_improvement(base_total, tool_total)])
-    return rows or [["no comparable tool rows", "n/a", "n/a", "n/a"]]
+            rows.append([variant_id, str(base_total), str(tool_total), pct_improvement(base_total, tool_total), "observed"])
+    return rows or [["no comparable tool rows", "n/a", "n/a", "n/a", "n/a"]]
+
+
+def mechanism_observed(run: dict[str, Any], baseline_id: str) -> bool:
+    if str(run.get("variant_id")) == baseline_id:
+        return True
+    checks = run.get("mechanism_checks")
+    return isinstance(checks, dict) and checks.get("required") is True and checks.get("ok") is True
+
+
+def mechanism_summary(run: dict[str, Any], baseline_id: str) -> str:
+    if str(run.get("variant_id")) == baseline_id:
+        return "baseline"
+    checks = run.get("mechanism_checks")
+    if not isinstance(checks, dict) or not checks.get("required"):
+        return "not checked"
+    if checks.get("ok"):
+        return "observed"
+    failed = []
+    for item in checks.get("checks") or []:
+        if isinstance(item, dict) and not item.get("ok"):
+            failed.append(str(item.get("label") or item.get("type") or "check"))
+    return "not observed" + (f": {', '.join(failed)}" if failed else "")
 
 
 def build_report(results_list: list[dict[str, Any]]) -> str:
@@ -1234,6 +1473,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                 "baseline tokens",
                 "tool tokens",
                 "token result",
+                "mechanism",
                 "model",
                 "reasoning",
                 "task",
@@ -1245,9 +1485,10 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                     row["tool"],
                     row["tool_label"],
                     row["agent"],
-                    str(row["baseline_tokens"]),
-                    str(row["tool_tokens"]),
-                    pct_improvement(row["baseline_tokens"], row["tool_tokens"]),
+                    row["baseline_tokens_display"],
+                    row["tool_tokens_display"],
+                    row["token_result"],
+                    row["mechanism"],
                     row["model"],
                     row["reasoning"],
                     row["task_id"],
@@ -1269,17 +1510,19 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                 "tool input",
                 "tool output",
                 "tool reasoning",
+                "mechanism",
                 "duration",
             ],
             [
                 [
                     row["tool"],
-                    str(row["baseline_usage"].get("input_tokens", 0)),
-                    str(row["baseline_usage"].get("output_tokens", 0)),
-                    str(row["baseline_usage"].get("reasoning_output_tokens", 0)),
-                    str(row["tool_usage"].get("input_tokens", 0)),
-                    str(row["tool_usage"].get("output_tokens", 0)),
-                    str(row["tool_usage"].get("reasoning_output_tokens", 0)),
+                    usage_cell(row, "baseline_usage", "input_tokens"),
+                    usage_cell(row, "baseline_usage", "output_tokens"),
+                    usage_cell(row, "baseline_usage", "reasoning_output_tokens"),
+                    usage_cell(row, "tool_usage", "input_tokens"),
+                    usage_cell(row, "tool_usage", "output_tokens"),
+                    usage_cell(row, "tool_usage", "reasoning_output_tokens"),
+                    row["mechanism"],
                     format_duration(row["duration_ms"]),
                 ]
                 for row in rows
@@ -1303,7 +1546,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
             "- One task and one replicate per row; use directionally, not as a confidence interval.",
             "- Rows from different result batches have different paired baselines; compare each row to its own baseline.",
             "- Agent integrations differ: hook/proxy/MCP rows are not interchangeable across Codex, Claude, Gemini, or non-coding research sessions.",
-            "- Tool exposure is not always tool use; inspect session logs before making global defaults from a row.",
+            "- A token result is reported only when the task oracle passed and the configured tool mechanism check was observed.",
         ]
     )
     return "\n".join(lines)
@@ -1333,12 +1576,20 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             task = tasks.get(task_id, {})
             oracle_commands = run.get("success_commands") or baseline.get("success_commands") or []
+            observed = mechanism_observed(run, baseline_id)
+            baseline_tokens = int(baseline.get("token_total") or 0)
+            tool_tokens = int(run.get("token_total") or 0)
             rows.append(
                 {
                     "tool": variant_id,
                     "tool_label": (variants.get(variant_id) or {}).get("label", variant_id),
-                    "baseline_tokens": int(baseline.get("token_total") or 0),
-                    "tool_tokens": int(run.get("token_total") or 0),
+                    "baseline_tokens": baseline_tokens,
+                    "tool_tokens": tool_tokens,
+                    "baseline_tokens_display": str(baseline_tokens) if observed else "not reported",
+                    "tool_tokens_display": str(tool_tokens) if observed else "not reported",
+                    "token_result": pct_improvement(baseline_tokens, tool_tokens) if observed else "not measured",
+                    "mechanism": mechanism_summary(run, baseline_id),
+                    "mechanism_ok": observed,
                     "baseline_usage": baseline.get("token_usage") or {},
                     "tool_usage": run.get("token_usage") or {},
                     "agent": str(run.get("agent") or results.get("agent") or "codex"),
@@ -1431,6 +1682,13 @@ def unique_nonempty(values: list[str]) -> list[str]:
             out.append(value)
             seen.add(value)
     return out
+
+
+def usage_cell(row: dict[str, Any], usage_key: str, token_key: str) -> str:
+    if not row.get("mechanism_ok"):
+        return "not reported"
+    usage = row.get(usage_key)
+    return str(usage.get(token_key, 0)) if isinstance(usage, dict) else "0"
 
 
 def format_duration(ms: int) -> str:

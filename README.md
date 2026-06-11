@@ -10,57 +10,46 @@ provider-reported session total:
 total_token_usage.total_tokens per successful task
 ```
 
-## Current Smoke Result
+## Current Valid Result
 
-Reference run: 2026-06-11, one Go maintenance task in a tested desktop utility repo, one
-replicate per row. Each row uses the paired baseline from the same batch.
+No maintainer-mode token deltas are currently published.
 
-| tool | agent / model | maintainer-mode condition tested | baseline tokens | tool tokens | token result | oracle |
-| --- | --- | --- | ---: | ---: | ---: | --- |
-| [context-mode](https://github.com/mksglu/context-mode) | Codex `gpt-5.5` low | MCP plus lifecycle hooks in isolated `CODEX_HOME` | 796319 | 657650 | +17.4% | pass |
-| [context-mode](https://github.com/mksglu/context-mode) | Claude Sonnet low | MCP plus Claude-style lifecycle hooks | 559867 | 967624 | -72.8% | pass |
-| [Headroom](https://github.com/chopratejas/headroom) | Codex `gpt-5.5` low | `headroom wrap codex --no-serena` | 796319 | 730580 | +8.3% | pass |
-| [Headroom](https://github.com/chopratejas/headroom) | Claude Sonnet low | `headroom wrap claude --no-serena` | 559867 | 861004 | -53.8% | pass |
-| [RTK](https://github.com/rtk-ai/rtk) | Codex `gpt-5.5` low | Codex `AGENTS.md`/`RTK.md` instructions, ultra-compact wrappers | 796319 | 638112 | +19.9% | pass |
-| [RTK](https://github.com/rtk-ai/rtk) | Claude Sonnet low | Claude `PreToolUse` Bash rewrite hook, ultra-compact mode | 559867 | 505027 | +9.8% | pass |
-| [SEMMAP](https://github.com/junovhs/semmap) | Codex `gpt-5.5` low | `semmap generate --chat-output`, prompt requires minimal working set | 1021707 | 617922 | +39.5% | pass |
-| [SEMMAP](https://github.com/junovhs/semmap) | Claude Sonnet low | `semmap generate --chat-output`, prompt requires minimal working set | 417949 | 1459564 | -249.2% | pass |
-| [Repomix](https://github.com/yamadashy/repomix) | Codex `gpt-5.5` low | Repomix MCP, incremental focused packing/retrieval | 796319 | 857928 | -7.7% | pass |
-| [Repomix](https://github.com/yamadashy/repomix) | Claude Sonnet low | Repomix MCP, incremental focused packing/retrieval | 559867 | 376623 | +32.7% | pass |
-| [Gitingest](https://github.com/coderamp-labs/gitingest) | Codex `gpt-5.5` low | focused digest with explicit include patterns | 1021707 | 933131 | +8.7% | pass |
-| [Gitingest](https://github.com/coderamp-labs/gitingest) | Claude Sonnet low | focused digest with explicit include patterns | 417949 | 1777156 | -325.2% | pass |
+The first smoke run was withdrawn because it measured task success and provider
+tokens, but did not require proof that each tool's token-saving mechanism
+actually participated. Tokensmash now reports a token result only when both are
+true:
 
-`oracle = pass` means the final code passed the task's verification command. It
-does not mean the tool was token-efficient. `token result` is the benchmark
-outcome.
+1. The task oracle passes.
+2. The configured mechanism check is observed.
 
-## What This Result Means
+Rows that pass the task but fail mechanism evidence are shown as:
 
-The reference task was one focused maintenance bug fix in a tested Go
-repository. The agent had to modify code and tests, then pass:
+| tool | baseline token spend | token spend with tool | percent improvement | mechanism |
+| --- | --- | --- | --- | --- |
+| example_tool | not reported | not reported | not measured | not observed |
+
+## Benchmark Scope
+
+The bundled suite is aimed at focused maintenance tasks in existing tested
+repositories. A task should ask the agent to modify code and then pass a real
+verification command, for example:
 
 ```bash
 go test ./...
 ```
 
-The smoke result is most relevant to small-to-medium coding tasks in existing
-tested repositories. It should not be generalized to greenfield builds, large
+Results from this suite should not be generalized to greenfield builds, large
 refactors, UI work, documentation tasks, research tasks, or long multi-session
-debugging.
+debugging without adding tasks that represent those workflows.
 
-Important caveats:
+Validity rules:
 
-- One task and one replicate per row.
-- Rows came from multiple bounded batches; compare each row only to its paired
-  baseline.
-- Tool exposure is not always tool use. The Codex Headroom run launched the
-  maintainer wrapper, but the Headroom proxy log showed `0` routed requests in
-  this environment, so that row is not causal proof of Headroom savings.
+- Passing the task oracle is required but not sufficient.
+- A tool row must also pass its mechanism check.
+- Rows from different result batches must be compared only to their paired
+  baseline from the same batch, task, and replicate.
 - Claude totals include provider-reported input, cache creation, cache read, and
   output tokens from `claude --output-format json`.
-- This is a single smoke task, not a leaderboard.
-
-Treat these as benchmark harness checks and directional evidence.
 
 ## Run Your Own Benchmark
 
@@ -110,6 +99,11 @@ The generic suite includes:
 `semmap` requires `SEMMAP_BIN`. `gitingest` requires
 `TARGET_CONTEXT_INCLUDE`, and optionally accepts `TARGET_CONTEXT_EXCLUDE`.
 
+Each non-baseline variant includes a mechanism check. Examples: context-mode
+and Repomix must appear in agent tool calls; Headroom must report nonzero routed
+requests; SEMMAP and Gitingest must generate their artifact and the agent must
+use it from a tool call.
+
 ## Session Log Audits
 
 Tokensmash can summarize local agent session logs without copying raw
@@ -128,7 +122,7 @@ counts, and byte counts. Do not commit raw session logs. See
 
 ## Improving The Benchmark
 
-To turn smoke results into stronger evidence:
+To turn early results into stronger evidence:
 
 - Run many public tasks across languages and repo sizes.
 - Use 3-5 replicates per tool and report median/range.
