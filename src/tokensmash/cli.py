@@ -1374,7 +1374,14 @@ def resolve_results_path(path: Path) -> Path:
 def print_table(results: dict[str, Any]) -> None:
     baseline_id = str(results["baseline"])
     rows = comparison_rows(results, baseline_id)
-    headers = ["tool", "baseline token spend", "token spend with tool", "percent improvement", "mechanism"]
+    headers = [
+        "tool",
+        "baseline token spend",
+        "token spend with tool",
+        "percent improvement",
+        "confidence",
+        "mechanism",
+    ]
     widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * widths[i] for i in range(len(headers))))
@@ -1420,14 +1427,32 @@ def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]
             tool_total += int(tool_tokens)
             measured_pairs += 1
         if measured_pairs == 0 and invalid_pairs == 0:
-            rows.append([variant_id, "n/a", "n/a", "n/a", "not observed"])
+            rows.append([variant_id, "n/a", "n/a", "n/a", "none", "not observed"])
         elif measured_pairs == 0:
-            rows.append([variant_id, "not reported", "not reported", "not measured", "not observed"])
+            rows.append([variant_id, "not reported", "not reported", "not measured", "none", "not observed"])
         elif invalid_pairs:
-            rows.append([variant_id, str(base_total), str(tool_total), pct_improvement(base_total, tool_total), "partially observed"])
+            rows.append(
+                [
+                    variant_id,
+                    str(base_total),
+                    str(tool_total),
+                    pct_improvement(base_total, tool_total),
+                    actionable_confidence(base_total, tool_total, measured_pairs, invalid_pairs),
+                    "partially observed",
+                ]
+            )
         else:
-            rows.append([variant_id, str(base_total), str(tool_total), pct_improvement(base_total, tool_total), "observed"])
-    return rows or [["no comparable tool rows", "n/a", "n/a", "n/a", "n/a"]]
+            rows.append(
+                [
+                    variant_id,
+                    str(base_total),
+                    str(tool_total),
+                    pct_improvement(base_total, tool_total),
+                    actionable_confidence(base_total, tool_total, measured_pairs, invalid_pairs),
+                    "observed",
+                ]
+            )
+    return rows or [["no comparable tool rows", "n/a", "n/a", "n/a", "none", "n/a"]]
 
 
 def mechanism_observed(run: dict[str, Any], baseline_id: str) -> bool:
@@ -1473,6 +1498,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                 "baseline tokens",
                 "tool tokens",
                 "token result",
+                "confidence",
                 "mechanism",
                 "model",
                 "reasoning",
@@ -1488,6 +1514,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
                     row["baseline_tokens_display"],
                     row["tool_tokens_display"],
                     row["token_result"],
+                    row["confidence"],
                     row["mechanism"],
                     row["model"],
                     row["reasoning"],
@@ -1547,6 +1574,7 @@ def build_report(results_list: list[dict[str, Any]]) -> str:
             "- Rows from different result batches have different paired baselines; compare each row to its own baseline.",
             "- Agent integrations differ: hook/proxy/MCP rows are not interchangeable across Codex, Claude, Gemini, or non-coding research sessions.",
             "- A token result is reported only when the task oracle passed and the configured tool mechanism check was observed.",
+            "- Confidence is about actionability of the percent change, not proof that the tool is universally better.",
         ]
     )
     return "\n".join(lines)
@@ -1579,6 +1607,7 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
             observed = mechanism_observed(run, baseline_id)
             baseline_tokens = int(baseline.get("token_total") or 0)
             tool_tokens = int(run.get("token_total") or 0)
+            confidence = actionable_confidence(baseline_tokens, tool_tokens, 1 if observed else 0, 0 if observed else 1)
             rows.append(
                 {
                     "tool": variant_id,
@@ -1588,6 +1617,7 @@ def benchmark_rows(results_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "baseline_tokens_display": str(baseline_tokens) if observed else "not reported",
                     "tool_tokens_display": str(tool_tokens) if observed else "not reported",
                     "token_result": pct_improvement(baseline_tokens, tool_tokens) if observed else "not measured",
+                    "confidence": confidence if observed else "none",
                     "mechanism": mechanism_summary(run, baseline_id),
                     "mechanism_ok": observed,
                     "baseline_usage": baseline.get("token_usage") or {},
@@ -1689,6 +1719,23 @@ def usage_cell(row: dict[str, Any], usage_key: str, token_key: str) -> str:
         return "not reported"
     usage = row.get(usage_key)
     return str(usage.get(token_key, 0)) if isinstance(usage, dict) else "0"
+
+
+def actionable_confidence(baseline: int, tool: int, measured_pairs: int, invalid_pairs: int) -> str:
+    if baseline <= 0 or tool <= 0 or measured_pairs <= 0:
+        return "none"
+    if invalid_pairs:
+        return "low"
+    delta = abs((baseline - tool) / baseline * 100)
+    if measured_pairs < 3:
+        return "low"
+    if measured_pairs < 5:
+        return "medium" if delta >= 10 else "low"
+    if delta < 5:
+        return "low"
+    if delta < 10:
+        return "medium"
+    return "high"
 
 
 def format_duration(ms: int) -> str:

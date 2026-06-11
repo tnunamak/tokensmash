@@ -24,9 +24,9 @@ true:
 
 Rows that pass the task but fail mechanism evidence are shown as:
 
-| tool | baseline token spend | token spend with tool | percent improvement | mechanism |
-| --- | --- | --- | --- | --- |
-| example_tool | not reported | not reported | not measured | not observed |
+| tool | baseline token spend | token spend with tool | percent improvement | confidence | mechanism |
+| --- | --- | --- | --- | --- | --- |
+| example_tool | not reported | not reported | not measured | none | not observed |
 
 ## Benchmark Scope
 
@@ -46,6 +46,8 @@ Validity rules:
 
 - Passing the task oracle is required but not sufficient.
 - A tool row must also pass its mechanism check.
+- Confidence describes whether the reported percent change is actionable for
+  this benchmark sample, not whether a tool is universally better.
 - Rows from different result batches must be compared only to their paired
   baseline from the same batch, task, and replicate.
 - Claude totals include provider-reported input, cache creation, cache read, and
