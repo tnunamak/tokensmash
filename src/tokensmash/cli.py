@@ -32,10 +32,16 @@ CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SUITE = Path(__file__).resolve().parent / "data" / "suites" / "generic" / "tool-comparison.json"
+# Legacy-bench pricing. The canonical, versioned price tables live in
+# data/pricing/*.json (used by ingest/opportunity/analyze); this constant is
+# only consulted by the synthetic benchmark's run_api_cost. Values verified
+# against platform.openai.com/docs/pricing 2026-06-12 (short-context tier).
+# NOTE: the previous values here (2.50/0.25/15.00) were gpt-5.4's prices
+# mislabeled as gpt-5.5 — absolute USD in older bench reports is ~2x low.
 GPT55_SHORT_CONTEXT_PRICES = {
-    "fresh_input_per_m": 2.50,
-    "cached_input_per_m": 0.25,
-    "output_per_m": 15.00,
+    "fresh_input_per_m": 5.00,
+    "cached_input_per_m": 0.50,
+    "output_per_m": 30.00,
 }
 
 
