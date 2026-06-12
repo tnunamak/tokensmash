@@ -1,146 +1,190 @@
 # Tokensmash
 
-Tokensmash measures whether agent tooling actually reduces end-to-end token
-spend on successful coding tasks.
+Tokensmash is a measurement instrument for whether token-saving agent tools are
+worth enabling. It measures from provider-billed usage in your own session logs
+— not from tool self-reporting, not from vendor claims. It is not itself a
+token-saving tool.
 
-It does not trust tool self-reported savings. The primary metric is the
-provider-reported session total:
+Two layers:
 
-```text
-total_token_usage.total_tokens per successful task
-```
+- **Layer 0 (opportunity):** reads your real session history and computes an
+  upper bound on what each tool could save if it were 100% effective. These are
+  deliberate ceilings, not predictions.
+- **Layer 1 (crossover study):** a pre-registered within-repo A/B design that
+  measures whether enabling a tool as the default policy actually moves
+  billed-equivalent cost per 2-hour work block.
 
-## Current Valid Result
+---
 
-No maintainer-mode token deltas are currently published.
-
-The first smoke run was withdrawn because it measured task success and provider
-tokens, but did not require proof that each tool's token-saving mechanism
-actually participated. Tokensmash now reports a token result only when both are
-true:
-
-1. The task oracle passes.
-2. The configured mechanism check is observed.
-
-Rows that pass the task but fail mechanism evidence are shown as:
-
-| tool | baseline token spend | token spend with tool | percent improvement | confidence | mechanism |
-| --- | --- | --- | --- | --- | --- |
-| example_tool | not reported | not reported | not measured | none | not observed |
-
-## Benchmark Scope
-
-The bundled suite is aimed at focused maintenance tasks in existing tested
-repositories. A task should ask the agent to modify code and then pass a real
-verification command, for example:
+## 10-minute quickstart
 
 ```bash
-go test ./...
+# Install
+uv tool install git+https://github.com/tnunamak/tokensmash
+
+# Parse your local agent transcripts into the normalized store
+tokensmash ingest
+
+# Print Layer-0 opportunity ceilings
+tokensmash opportunity
 ```
 
-Results from this suite should not be generalized to greenfield builds, large
-refactors, UI work, documentation tasks, research tasks, or long multi-session
-debugging without adding tasks that represent those workflows.
+`ingest` reads `~/.codex/sessions` and `~/.claude/projects` by default. It
+writes to `~/.local/state/tokensmash/study/sessions.jsonl`. No prompt text,
+file content, or tool output is stored — only numeric usage counters and keyed
+hashes of identifiers.
 
-Validity rules:
+`opportunity` prints per-tool ceilings in API-equivalent USD (per-session
+records additionally carry exact Codex credit costs). Read the numbers as
+"maximum plausible saving if this tool compressed its target tokens to zero." Most
+output-compressor ceilings are small in the reference dataset; interpret them as
+such before deciding whether to run a study.
 
-- Passing the task oracle is required but not sufficient.
-- A tool row must also pass its mechanism check.
-- Confidence describes whether the reported percent change is actionable for
-  this benchmark sample, not whether a tool is universally better.
-- Rows from different result batches must be compared only to their paired
-  baseline from the same batch, task, and replicate.
-- Claude totals include provider-reported input, cache creation, cache read, and
-  output tokens from `claude --output-format json`.
+---
 
-## Run Your Own Benchmark
+## What the numbers mean
 
-The bundled suite is generic. It does not assume your repos, tools, or paths.
+**Ceilings are upper bounds, not estimates.** The `with_rereads_usd` column
+assumes 100% compression of the tool's addressable tokens and includes
+cache-read savings on subsequent requests. The actual saving will be lower —
+often much lower.
+
+**USD figures are API-equivalent.** They are computed from provider-published
+per-token-type rates with versioned pricing files (`pricing_id` per session).
+
+**Codex credits are exact.** OpenAI publishes per-token-type credit rates; the
+`cost_codex_credits` field is computed from those rates (`credit_rate_id` per
+session).
+
+**Claude subscription quota is opaque.** Anthropic does not publish the
+weighting applied to subscription quota. Only API-equivalent USD is claimed for
+Claude Code sessions; the tool does not attempt to model quota pressure.
+
+**Cache reads dominate real agent spend.** In the reference dataset, a large
+fraction of billed tokens are cache reads. This is why most tool ceilings are
+small: the tools target fresh-input tokens, but most tokens are already cached
+by the time the agent reaches steady state in a session.
+
+---
+
+## Crossover study
+
+If a tool's ceiling exceeds the minimum detectable effect at your usage level
+(`tokensmash study power`), you can run a pre-registered crossover study that
+measures the causal effect of the policy "tool default-enabled."
+
+The design: repo × UTC 2-hour block is the randomization unit. Arms alternate
+deterministically (on / off) across consecutive groups of 8 blocks, guaranteeing
+4/4 balance per group. Actuation is launcher-based and never injects text into
+the agent's context. The estimand is intention-to-treat: arm assignment, not
+whether the tool was invoked, determines group membership.
+
+See [`PROTOCOL.md`](PROTOCOL.md) for the full pre-registered protocol and
+[`docs/replication.md`](docs/replication.md) for the replication kit.
+
+**Current gate result (2026-06-12):** at 47.4 weeks of pre-study history,
+RTK, context-mode, and Repomix ceilings fall below the 8-week MDE — documented
+as unmeasurable at current usage levels. Headroom (wire-payload ceiling 77.3%
+of mean block cost) exceeds the raw MDE and is the sole tool in the current
+epoch.
+
+### Commands
+
+| Command | Status |
+|---|---|
+| `tokensmash ingest` | available |
+| `tokensmash opportunity` | available |
+| `tokensmash study init` | available |
+| `tokensmash study link` | available (SessionStart hook entrypoint) |
+| `tokensmash study arm` | available (launcher entrypoint) |
+| `tokensmash study power` | available |
+| `tokensmash study export` | available |
+| `tokensmash study analyze` | available (pre-registered inference) |
+| `tokensmash study install` | available (config check/apply) |
+| `tokensmash launch` | available (actuation launcher) |
+| `tokensmash replay` | available (realized-compression estimates) |
+| `tokensmash trajectory` | available (wasted-exploration analysis) |
+| `tokensmash meta` | available (multi-machine aggregation) |
+
+---
+
+## Honest findings (reference dataset)
+
+All figures are from one subject's session history. They should not be
+generalized without replication.
+
+- Cache reads account for the majority of billed tokens in steady-state agent
+  sessions. Tools that compress fresh-input tokens show small ceilings because
+  most tokens are no longer fresh by the time they re-enter context.
+- RTK, context-mode, and Repomix ceilings are each below 21% of mean block
+  cost in the reference dataset.
+- Headroom's ceiling is higher (77% of mean block cost) because it targets the
+  full wire payload including cache-read traffic, but its mechanism can also
+  break prefix caching; the net effect is the thing the study measures.
+- "Ceiling is small" is a result, not a failure of the measurement. It means
+  the tool cannot be worth much at current usage levels regardless of how well
+  it works.
+
+---
+
+## Legacy synthetic benchmark
+
+The original tokensmash benchmark ran synthetic tasks against cloned repos with
+controlled variants. That infrastructure (`tokensmash run`, `tokensmash plan`,
+`tokensmash table`, `tokensmash aggregate`, `tokensmash report`) is still
+present and usable, but **results from it should be treated as directional
+only**.
+
+Known limitations:
+
+- **Provider-cache position confounds.** ~~Randomized order records a seed but
+  does not balance positions, so a variant can land first on every task by
+  chance.~~ **Repaired** (`--balance-positions`): generates a Latin-square
+  rotation so each variant occupies each within-task position equally; design
+  matrix is recorded in `results.json`; strict mode now requires either
+  `--balance-positions` or `--randomize-order`.
+- **Single baseline run per task.** ~~Baseline stochastic variance is
+  unmeasured and shared across all tool comparisons, correlating the tool
+  rows.~~ **Repaired** (`--baseline-replicates N`): runs the baseline N times
+  per task; aggregate pairs each tool run against the mean of baseline
+  replicates and reports a "baseline sd" column.
+- **Strict gate is not code-version-stamped.** **Repaired**: `results.json`
+  now carries a `code_version` stamp (`bench_audit_version`, `git`, `package`);
+  `aggregate --strict` refuses files lacking `bench_audit_version==2`.
+- **Toy tasks.** Small synthetic repair fixtures mostly measure fixed tool
+  overhead, not the savings the tools exist to deliver. Not yet repaired.
+
+Until all repairs are in production runs, use the synthetic benchmark
+only for tool × task-class exploration, not for publishable improvement claims.
+
+### Run the synthetic benchmark
 
 ```bash
 git clone https://github.com/tnunamak/tokensmash
 cd tokensmash
 
 export TARGET_REPO=~/code/my-project
-export TARGET_BASE_REF=HEAD
-export TARGET_PROMPT='Fix the failing test with the smallest correct change.'
 export TARGET_TEST_COMMAND='npm test'
-export TARGET_CONTEXT_INCLUDE='src/**/*.ts,package.json'
+export TARGET_PROMPT='Fix the failing test with the smallest correct change.'
 
-uv run tokensmash plan --variants context_mode
-uv run tokensmash run --live --variants context_mode --run-id my-project-context-mode
-uv run tokensmash report ~/.local/state/tokensmash/ab-runs/my-project-context-mode/results.json -o reports/my-project-context-mode.md
+uv run tokensmash plan
+uv run tokensmash run --live --variants rtk --run-id my-project-rtk
+uv run tokensmash table ~/.local/state/tokensmash/ab-runs/my-project-rtk
 ```
 
-`run` is dry-run by default. Add `--live` only when intentionally spending model
-quota. Variants skip cleanly when required commands or environment variables are
-missing.
+`run` is dry-run by default. Add `--live` only when intentionally spending
+model quota.
 
-To run Claude Sonnet rows:
+---
 
-```bash
-export TOKENSMASH_AGENT=claude
-export TOKENSMASH_CLAUDE_MODEL=sonnet
-export TOKENSMASH_MAX_BUDGET_USD=1.50
-
-uv run tokensmash run --live --variants rtk,repomix --run-id my-project-claude-sonnet
-```
-
-## Tool Conditions Included
-
-The generic suite includes:
-
-- `baseline_no_user_config`
-- `context_mode`
-- `headroom`
-- `rtk`
-- `semmap`
-- `repomix`
-- `gitingest`
-
-`semmap` requires `SEMMAP_BIN`. `gitingest` requires
-`TARGET_CONTEXT_INCLUDE`, and optionally accepts `TARGET_CONTEXT_EXCLUDE`.
-
-Each non-baseline variant includes a mechanism check. Examples: context-mode
-and Repomix must appear in agent tool calls; Headroom must report nonzero routed
-requests; SEMMAP and Gitingest must generate their artifact and the agent must
-use it from a tool call.
-
-## Session Log Audits
-
-Tokensmash can summarize local agent session logs without copying raw
-transcripts into the repo:
-
-```bash
-uv run tokensmash sessions --agent all --days 7
-uv run tokensmash sessions --agent codex --codex-root ~/.codex/sessions -o results/my-codex-sessions.json
-uv run tokensmash sessions --agent claude --claude-root ~/.claude/projects -o results/my-claude-sessions.json
-uv run tokensmash sessions --agent gemini --gemini-root ~/.gemini -o results/my-gemini-sessions.json
-```
-
-The output is sanitized aggregate JSON: file hashes, token counters, tool-call
-counts, and byte counts. Do not commit raw session logs. See
-[`docs/session-privacy.md`](docs/session-privacy.md).
-
-## Improving The Benchmark
-
-To turn early results into stronger evidence:
-
-- Run many public tasks across languages and repo sizes.
-- Use 3-5 replicates per tool and report median/range.
-- Randomize run order.
-- Record actual tool-use evidence per row.
-- Test each tool in its real default integration mode.
-- Publish task manifests, base refs, prompts, oracle commands, patch hashes, and
-  sanitized token summaries.
-
-## Repository Layout
+## Repository layout
 
 ```text
-src/tokensmash/            CLI and benchmark harness
-suites/                    runnable benchmark suites and templates
-tasks/                     optional reusable task cards
-results/                   sanitized result summaries only
-reports/                   benchmark-card Markdown reports
-docs/                      design notes and privacy rules
+src/tokensmash/       CLI and study harness
+docs/                 design notes (study-architecture.md, CONTRACTS.md, ...)
+suites/               synthetic benchmark suite definitions
+tasks/                reusable synthetic task cards
+results/              sanitized result summaries only
+reports/              benchmark-card Markdown reports
+PROTOCOL.md           pre-registered crossover study protocol
 ```
