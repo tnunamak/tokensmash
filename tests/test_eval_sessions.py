@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tokensmash.cli import audit_run_methodology, aggregate_rows, comparison_rows, eval_sessions, prepare_variant_codex_home  # noqa: E402
+from tokensmash.cli import audit_run_methodology, audit_suite_methodology, aggregate_rows, comparison_rows, eval_sessions, prepare_variant_codex_home, safe_env_audit  # noqa: E402
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -163,6 +163,7 @@ class EvalSessionsTest(unittest.TestCase):
     def test_aggregate_rows_sum_paired_successful_runs(self) -> None:
         result_one = {
             "baseline": "baseline",
+            "suite_methodology_audit": {"ok": True},
             "runs": [
                 {
                     "success": True,
@@ -171,6 +172,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "variant_id": "baseline",
                     "token_total": 1000,
                     "token_usage": {"input_tokens": 950, "cached_input_tokens": 700, "output_tokens": 50, "total_tokens": 1000},
+                    "methodology_audit": {"ok": True},
                 },
                 {
                     "success": True,
@@ -180,11 +182,13 @@ class EvalSessionsTest(unittest.TestCase):
                     "token_total": 800,
                     "token_usage": {"input_tokens": 760, "cached_input_tokens": 650, "output_tokens": 40, "total_tokens": 800},
                     "mechanism_checks": {"required": True, "ok": True, "checks": []},
+                    "methodology_audit": {"ok": True},
                 },
             ],
         }
         result_two = {
             "baseline": "baseline",
+            "suite_methodology_audit": {"ok": True},
             "runs": [
                 {
                     "success": True,
@@ -193,6 +197,7 @@ class EvalSessionsTest(unittest.TestCase):
                     "variant_id": "baseline",
                     "token_total": 2000,
                     "token_usage": {"input_tokens": 1900, "cached_input_tokens": 1000, "output_tokens": 100, "total_tokens": 2000},
+                    "methodology_audit": {"ok": True},
                 },
                 {
                     "success": True,
@@ -202,11 +207,12 @@ class EvalSessionsTest(unittest.TestCase):
                     "token_total": 2200,
                     "token_usage": {"input_tokens": 2050, "cached_input_tokens": 900, "output_tokens": 150, "total_tokens": 2200},
                     "mechanism_checks": {"required": True, "ok": True, "checks": []},
+                    "methodology_audit": {"ok": True},
                 },
             ],
         }
 
-        rows = aggregate_rows([result_one, result_two])
+        rows = aggregate_rows([result_one, result_two], strict=True)
 
         self.assertEqual(rows[0][0], "rtk")
         self.assertEqual(rows[0][1], "2")
@@ -236,6 +242,9 @@ class EvalSessionsTest(unittest.TestCase):
             self.assertEqual(env["HOME"], str(case_dir / "home"))
             self.assertEqual(env["CODEX_HOME"], str(case_dir / "home" / ".codex"))
             self.assertTrue((case_dir / "home" / ".codex" / "auth.json").exists())
+            audit = safe_env_audit(env, case_dir)
+            self.assertTrue(audit["home_isolated"])
+            self.assertTrue(audit["codex_home_isolated"])
 
     def test_methodology_audit_requires_isolated_session_path(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -256,6 +265,12 @@ class EvalSessionsTest(unittest.TestCase):
                     "output_tokens": 10,
                     "total_tokens": 100,
                 },
+                "env_audit": {
+                    "home_isolated": True,
+                    "codex_home_isolated": True,
+                    "HOME": str(case_dir / "home"),
+                    "CODEX_HOME": str(case_dir / "home" / ".codex"),
+                },
                 "variant_id": "baseline",
             }
 
@@ -267,6 +282,20 @@ class EvalSessionsTest(unittest.TestCase):
             audit = audit_run_methodology(result, {"isolated_home": True}, "baseline")
 
             self.assertFalse(audit["ok"])
+
+    def test_suite_methodology_audit_detects_host_config_change(self) -> None:
+        results = {
+            "host_fingerprint_before": {"config": {"sha256": "a"}},
+            "host_fingerprint_after": {"config": {"sha256": "a"}},
+            "randomized_order": True,
+            "runs": [{"run_order": 1, "status": "ok"}, {"run_order": 2, "status": "ok"}],
+        }
+
+        self.assertTrue(audit_suite_methodology(results)["ok"])
+
+        results["host_fingerprint_after"] = {"config": {"sha256": "b"}}
+
+        self.assertFalse(audit_suite_methodology(results)["ok"])
 
 
 if __name__ == "__main__":

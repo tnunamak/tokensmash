@@ -302,6 +302,7 @@ def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.N
             "raw agent stdout/stderr and last message are stored in the run directory for debugging",
         ],
     }
+    results["host_fingerprint_before"] = host_fingerprint()
     (run_dir / "suite.json").write_text(json.dumps(scrub_suite(suite), indent=2, sort_keys=True) + "\n")
     cases: list[tuple[dict[str, Any], dict[str, Any], int]] = []
     for task in selection["tasks"]:
@@ -336,6 +337,8 @@ def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.N
             results["runs"].append(result)
             write_results(run_dir, results)
     finally:
+        results["host_fingerprint_after"] = host_fingerprint()
+        results["suite_methodology_audit"] = audit_suite_methodology(results)
         write_results(run_dir, results)
     return run_dir
 
@@ -364,6 +367,7 @@ def run_one(
         prepare_repo(task, repo_dir)
         agent = variant_agent(suite, variant)
         env = case_env(suite, task, variant, case_dir, repo_dir, agent)
+        result["env_audit"] = safe_env_audit(env, case_dir)
         run_setup_commands(variant, case_dir, repo_dir, env)
         prompt = build_prompt(suite, task, variant, case_dir, repo_dir, agent)
         prompt_path = case_dir / "prompt.md"
@@ -895,6 +899,9 @@ def audit_run_methodology(
     if variant.get("isolated_home"):
         case_dir = Path(str(case_dir_value)).expanduser() if case_dir_value else None
         session_path = Path(str(session_path_value)).expanduser() if session_path_value else None
+        env_audit = result.get("env_audit") if isinstance(result.get("env_audit"), dict) else {}
+        add("HOME path isolated", bool(env_audit.get("home_isolated")), str(env_audit.get("HOME") or ""))
+        add("CODEX_HOME path isolated", bool(env_audit.get("codex_home_isolated")), str(env_audit.get("CODEX_HOME") or ""))
         add("session path present", session_path is not None and bool(str(session_path)))
         if case_dir and session_path:
             add(
@@ -2297,6 +2304,51 @@ def write_results(run_dir: Path, results: dict[str, Any]) -> None:
     (run_dir / "results.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
 
 
+def host_fingerprint() -> dict[str, Any]:
+    paths = [
+        Path.home() / ".codex" / "config.toml",
+        Path.home() / ".codex" / "hooks.json",
+    ]
+    return {str(path): file_fingerprint(path) for path in paths}
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"exists": False, "bytes": 0, "sha256": ""}
+    data = path.read_bytes()
+    return {"exists": True, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def safe_env_audit(env: dict[str, str], case_dir: Path) -> dict[str, Any]:
+    home = Path(env["HOME"]).expanduser() if env.get("HOME") else None
+    codex_home = Path(env["CODEX_HOME"]).expanduser() if env.get("CODEX_HOME") else None
+    return {
+        "HOME": str(home) if home else "",
+        "CODEX_HOME": str(codex_home) if codex_home else "",
+        "home_isolated": bool(home and path_is_relative_to(home, case_dir)),
+        "codex_home_isolated": bool(codex_home and path_is_relative_to(codex_home, case_dir)),
+    }
+
+
+def audit_suite_methodology(results: dict[str, Any]) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def add(label: str, ok: bool, detail: str = "") -> None:
+        item: dict[str, Any] = {"label": label, "ok": bool(ok)}
+        if detail:
+            item["detail"] = detail
+        checks.append(item)
+
+    before = results.get("host_fingerprint_before")
+    after = results.get("host_fingerprint_after")
+    add("host fingerprint captured", isinstance(before, dict) and isinstance(after, dict))
+    add("host config unchanged", before == after)
+    add("randomized order recorded", "randomized_order" in results)
+    run_orders = [run.get("run_order") for run in results.get("runs", []) if run.get("status") != "skipped"]
+    add("run order complete", sorted(run_orders) == list(range(1, len(run_orders) + 1)))
+    return {"ok": all(item["ok"] for item in checks), "checks": checks}
+
+
 def load_results(path: Path) -> dict[str, Any]:
     resolved = path.expanduser()
     data = json.loads(resolved.read_text())
@@ -2369,6 +2421,7 @@ def print_aggregate_table(results_list: list[dict[str, Any]], strict: bool = Fal
 def aggregate_rows(results_list: list[dict[str, Any]], strict: bool = False) -> list[list[str]]:
     aggregate: dict[str, dict[str, Any]] = {}
     for results in results_list:
+        suite_ok = suite_methodology_passed(results)
         baseline_id = str(results["baseline"])
         grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
         for run in results.get("runs", []):
@@ -2406,7 +2459,7 @@ def aggregate_rows(results_list: list[dict[str, Any]], strict: bool = False) -> 
                 if not mechanism_observed(tool, baseline_id):
                     bucket["invalid"] += 1
                     continue
-                if strict and not (methodology_passed(baseline) and methodology_passed(tool)):
+                if strict and not (suite_ok and methodology_passed(baseline) and methodology_passed(tool)):
                     bucket["methodology_excluded"] += 1
                     continue
                 tool_tokens = tool.get("token_total")
@@ -2594,11 +2647,18 @@ def methodology_passed(run: dict[str, Any]) -> bool:
     return audit.get("ok") is True
 
 
+def suite_methodology_passed(results: dict[str, Any]) -> bool:
+    audit = results.get("suite_methodology_audit")
+    if not isinstance(audit, dict):
+        return False
+    return audit.get("ok") is True
+
+
 def aggregate_methodology_cell(bucket: dict[str, Any]) -> str:
     excluded = int(bucket.get("methodology_excluded") or 0)
     pairs = int(bucket.get("pairs") or 0)
     if excluded:
-        return f"strict pass ({excluded} excluded)"
+        return f"{excluded} excluded"
     if pairs:
         return "pass"
     return "n/a"
