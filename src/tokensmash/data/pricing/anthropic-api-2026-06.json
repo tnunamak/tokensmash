@@ -1,0 +1,78 @@
+{
+  "id": "anthropic-api-2026-06",
+  "kind": "api_usd",
+  "agent": "claude-code",
+  "retrieved_at": "2026-06-12",
+  "source_urls": [
+    "https://www.anthropic.com/pricing",
+    "https://platform.claude.com/docs/en/about-claude/models/overview",
+    "https://platform.claude.com/docs/en/build-with-claude/prompt-caching"
+  ],
+  "notes": "cache_write_per_m reflects the 5-minute TTL cache write rate (1.25x base input). The 1-hour TTL cache write rate is 2x base input and is NOT used here. Cache read is 10% of base input.",
+  "models": {
+    "claude-sonnet-4-6": {
+      "fresh_input_per_m": 3.0,
+      "cache_read_per_m": 0.30,
+      "cache_write_per_m": 3.75,
+      "output_per_m": 15.0
+    },
+    "claude-sonnet-4-5": {
+      "fresh_input_per_m": 3.0,
+      "cache_read_per_m": 0.30,
+      "cache_write_per_m": 3.75,
+      "output_per_m": 15.0
+    },
+    "claude-opus-4-8": {
+      "fresh_input_per_m": 5.0,
+      "cache_read_per_m": 0.50,
+      "cache_write_per_m": 6.25,
+      "output_per_m": 25.0
+    },
+    "claude-opus-4-7": {
+      "fresh_input_per_m": 5.0,
+      "cache_read_per_m": 0.50,
+      "cache_write_per_m": 6.25,
+      "output_per_m": 25.0
+    },
+    "claude-opus-4-6": {
+      "fresh_input_per_m": 5.0,
+      "cache_read_per_m": 0.50,
+      "cache_write_per_m": 6.25,
+      "output_per_m": 25.0
+    },
+    "claude-opus-4-5": {
+      "fresh_input_per_m": 5.0,
+      "cache_read_per_m": 0.50,
+      "cache_write_per_m": 6.25,
+      "output_per_m": 25.0
+    },
+    "claude-haiku-4-5": {
+      "fresh_input_per_m": 1.0,
+      "cache_read_per_m": 0.10,
+      "cache_write_per_m": 1.25,
+      "output_per_m": 5.0
+    }
+  },
+  "match": [
+    {"pattern": "claude-sonnet-4-6", "model": "claude-sonnet-4-6"},
+    {"pattern": "claude-sonnet-4-5", "model": "claude-sonnet-4-5"},
+    {"pattern": "claude-opus-4-8", "model": "claude-opus-4-8"},
+    {"pattern": "claude-opus-4-7", "model": "claude-opus-4-7"},
+    {"pattern": "claude-opus-4-6", "model": "claude-opus-4-6"},
+    {"pattern": "claude-opus-4-5", "model": "claude-opus-4-5"},
+    {"pattern": "claude-haiku-4-5", "model": "claude-haiku-4-5"},
+    {"pattern": "sonnet-4-6", "model": "claude-sonnet-4-6"},
+    {"pattern": "sonnet-4-5", "model": "claude-sonnet-4-5"},
+    {"pattern": "opus-4-8", "model": "claude-opus-4-8"},
+    {"pattern": "opus-4-7", "model": "claude-opus-4-7"},
+    {"pattern": "opus-4-6", "model": "claude-opus-4-6"},
+    {"pattern": "opus-4-5", "model": "claude-opus-4-5"},
+    {"pattern": "haiku-4-5", "model": "claude-haiku-4-5"},
+    {"pattern": "sonnet-4", "model": "claude-sonnet-4-6"},
+    {"pattern": "opus-4", "model": "claude-opus-4-8"},
+    {"pattern": "haiku-4", "model": "claude-haiku-4-5"},
+    {"pattern": "sonnet", "model": "claude-sonnet-4-6"},
+    {"pattern": "opus", "model": "claude-opus-4-8"},
+    {"pattern": "haiku", "model": "claude-haiku-4-5"}
+  ]
+}

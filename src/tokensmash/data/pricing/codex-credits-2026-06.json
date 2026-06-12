@@ -1,0 +1,35 @@
+{
+  "id": "codex-credits-2026-06",
+  "kind": "codex_credits",
+  "agent": "codex",
+  "retrieved_at": "2026-06-12",
+  "source_urls": [
+    "https://developers.openai.com/codex/pricing"
+  ],
+  "notes": "Credits per 1M tokens as documented on the Codex pricing page. 'Input Tokens' maps to fresh_input_per_m (non-cached input). 'Cached input tokens' maps to cache_read_per_m. cache_write_per_m=0 because Codex/OpenAI caching is automatic with no explicit write-credit charge. GPT-5.4-mini credits: 18.75 input / 1.875 cached / 113 output (113 is the documented value, likely a rounding of 112.5).",
+  "models": {
+    "gpt-5.5": {
+      "fresh_input_per_m": 125.0,
+      "cache_read_per_m": 12.5,
+      "cache_write_per_m": 0.0,
+      "output_per_m": 750.0
+    },
+    "gpt-5.4": {
+      "fresh_input_per_m": 62.5,
+      "cache_read_per_m": 6.25,
+      "cache_write_per_m": 0.0,
+      "output_per_m": 375.0
+    },
+    "gpt-5.4-mini": {
+      "fresh_input_per_m": 18.75,
+      "cache_read_per_m": 1.875,
+      "cache_write_per_m": 0.0,
+      "output_per_m": 113.0
+    }
+  },
+  "match": [
+    {"pattern": "gpt-5.5", "model": "gpt-5.5"},
+    {"pattern": "gpt-5.4-mini", "model": "gpt-5.4-mini"},
+    {"pattern": "gpt-5.4", "model": "gpt-5.4"}
+  ]
+}

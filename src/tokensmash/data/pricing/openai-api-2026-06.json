@@ -1,0 +1,29 @@
+{
+  "id": "openai-api-2026-06",
+  "kind": "api_usd",
+  "agent": "codex",
+  "retrieved_at": "2026-06-12",
+  "source_urls": [
+    "https://platform.openai.com/docs/pricing",
+    "https://openai.com/api/pricing/"
+  ],
+  "notes": "gpt-5.5 and gpt-5.4 have two context-length pricing tiers: short context and long context. The threshold between short and long context is not explicitly documented on the pricing pages as of 2026-06-12. The values here use the short-context rates. gpt-5.5 short context: $5.00 input / $0.50 cached / $30.00 output per 1M. gpt-5.5 long context: $10.00 input / $1.00 cached / $45.00 output per 1M. gpt-5.4 short context: $2.50 input / $0.25 cached / $15.00 output per 1M. gpt-5.4 long context: $5.00 input / $0.50 cached / $22.50 output per 1M. cache_write_per_m=0 because OpenAI prompt caching is automatic (no explicit write cost charged).",
+  "models": {
+    "gpt-5.5": {
+      "fresh_input_per_m": 5.0,
+      "cache_read_per_m": 0.50,
+      "cache_write_per_m": 0.0,
+      "output_per_m": 30.0
+    },
+    "gpt-5.4": {
+      "fresh_input_per_m": 2.50,
+      "cache_read_per_m": 0.25,
+      "cache_write_per_m": 0.0,
+      "output_per_m": 15.0
+    }
+  },
+  "match": [
+    {"pattern": "gpt-5.5", "model": "gpt-5.5"},
+    {"pattern": "gpt-5.4", "model": "gpt-5.4"}
+  ]
+}
