@@ -1,0 +1,15 @@
+{
+  "tool_id": "headroom",
+  "actuation": "wrapper",
+  "agents": ["claude-code", "codex"],
+  "on_command": ["headroom", "wrap", "<tool>", "--no-serena", "--"],
+  "off_command": ["<tool>"],
+  "env": {"HEADROOM_TELEMETRY": "off"},
+  "version_observed": "0.24.0",
+  "epoch": "pilot-dryrun-202606",
+  "notes": [
+    "--no-serena isolates Headroom's request compression; the serena integration is itself a context tool and would confound the arm definition.",
+    "Actuation is launcher-based: only sessions started through the shell wrapper functions are actuated. Sessions launched by other paths (scripts, devcontainers, IDEs) remain unactuated regardless of arm label, diluting the ITT estimate toward zero (conservative).",
+    "The headroom wrap banner is visible at launch, so the operator is not blind to the arm."
+  ]
+}

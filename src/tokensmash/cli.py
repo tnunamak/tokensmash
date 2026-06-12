@@ -17,11 +17,14 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+
+BENCH_AUDIT_VERSION = 2
 
 STATE_DIR = Path.home() / ".local" / "state" / "tokensmash"
 AB_RUNS_DIR = STATE_DIR / "ab-runs"
@@ -37,6 +40,21 @@ GPT55_SHORT_CONTEXT_PRICES = {
 
 
 def main() -> int:
+    # SessionStart hook fast-path: must never write to stdout/stderr (hook
+    # stdout is injected into the agent's context) and must never exit
+    # non-zero (a failure would abort the user's session). Intercepted before
+    # argparse so argparse's own stderr output can never trigger.
+    if sys.argv[1:3] == ["study", "link"]:
+        return _study_link_silent(sys.argv[3:])
+    # Launcher fast-path: prints "on"/"off" (or nothing when no live study)
+    # for the cwd at the current time. Fail-open: any error → empty output,
+    # exit 0, so the launcher falls back to the plain agent.
+    if sys.argv[1:3] == ["study", "arm"]:
+        return _study_arm_silent(sys.argv[3:])
+    # Actuation fast-path: `tokensmash launch <claude|codex> [--] [args...]`
+    # resolves the arm and EXECS the (possibly wrapped) agent. Fail-open.
+    if sys.argv[1:2] == ["launch"]:
+        return _launch_exec(sys.argv[2:])
     parser = argparse.ArgumentParser(
         description="A/B benchmark tokensmashing tools by agent session-token spend."
     )
@@ -59,6 +77,18 @@ def main() -> int:
     run.add_argument("--keep-scratch", action="store_true")
     run.add_argument("--randomize-order", action="store_true", help="Shuffle task/variant execution order.")
     run.add_argument("--seed", type=int, default=0, help="Seed for --randomize-order.")
+    run.add_argument(
+        "--balance-positions",
+        action="store_true",
+        help="Use a balanced position design so each variant occupies each within-task position equally often.",
+    )
+    run.add_argument(
+        "--baseline-replicates",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run the baseline variant N times per task (default 1). Aggregate pairs each tool run against the mean.",
+    )
 
     table = sub.add_parser("table", help="Print baseline/tool/improvement table.")
     table.add_argument("results", help="Run directory or results.json.")
@@ -99,6 +129,47 @@ def main() -> int:
     eval_sessions_parser.add_argument("--headroom-perf", help="Headroom perf raw JSON from `headroom perf --format json --raw`.")
     eval_sessions_parser.add_argument("--no-artifacts", action="store_true", help="Skip local SEMMAP/Repomix/Gitingest artifact generation.")
     eval_sessions_parser.add_argument("-o", "--output", help="Write sanitized JSON result.")
+
+    ingest_parser = sub.add_parser("ingest", help="Parse local agent transcripts into the normalized study store.")
+    ingest_parser.add_argument("--codex-root", default=str(CODEX_SESSIONS_DIR))
+    ingest_parser.add_argument("--claude-root", default=str(CLAUDE_PROJECTS_DIR))
+    ingest_parser.add_argument("--since-days", type=float, help="Only parse transcript files modified in the last N days.")
+
+    opportunity_parser = sub.add_parser("opportunity", help="Layer-0 opportunity-ceiling report from the ingested store.")
+    opportunity_parser.add_argument("--since-days", type=float, help="Restrict to sessions started in the last N days.")
+
+    study = sub.add_parser("study", help="Randomized crossover study commands (see PROTOCOL.md).")
+    study_sub = study.add_subparsers(dest="study_cmd", required=True)
+    study_init = study_sub.add_parser("init", help="Create the study config (refuses to overwrite).")
+    study_init.add_argument("--study-id", required=True)
+    study_init.add_argument("--mode", choices=["log-only", "live"], default="log-only")
+    study_init.add_argument("--protocol-version", required=True)
+    study_sub.add_parser("link", help="SessionStart hook entrypoint (silent; reads hook JSON on stdin).")
+    study_sub.add_parser("power", help="MDE/power report from the ingested store.")
+    study_export = study_sub.add_parser("export", help="Write scrubbed shareable export of the session store.")
+    study_export.add_argument("-o", "--output", required=True)
+    study_analyze = study_sub.add_parser("analyze", help="Run the pre-registered analysis (PROTOCOL.md §5).")
+    study_analyze.add_argument("--protocol", default="PROTOCOL.md", help="Path to the registered protocol file.")
+    study_install = study_sub.add_parser("install", help="Check or apply hook/launcher configuration.")
+    study_install.add_argument("--apply", action="store_true", help="Idempotently write hook entries (JSON configs only).")
+
+    sub.add_parser("launch", help="Actuation launcher: tokensmash launch <claude|codex> [--] [args...] (execs the agent).")
+
+    replay_parser = sub.add_parser("replay", help="Offline realized-compression estimates from recorded tool outputs.")
+    replay_parser.add_argument("--codex-root", default=str(CODEX_SESSIONS_DIR))
+    replay_parser.add_argument("--claude-root", default=str(CLAUDE_PROJECTS_DIR))
+    replay_parser.add_argument("--tools", default="rtk,headroom")
+    replay_parser.add_argument("--limit-sessions", type=int, default=40)
+    replay_parser.add_argument("--seed", type=int, default=17)
+
+    trajectory_parser = sub.add_parser("trajectory", help="Wasted-exploration analysis from recorded sessions.")
+    trajectory_parser.add_argument("--codex-root", default=str(CODEX_SESSIONS_DIR))
+    trajectory_parser.add_argument("--claude-root", default=str(CLAUDE_PROJECTS_DIR))
+    trajectory_parser.add_argument("--limit-sessions", type=int, default=60)
+    trajectory_parser.add_argument("--seed", type=int, default=17)
+
+    meta_parser = sub.add_parser("meta", help="Merge scrubbed exports from multiple machines and report.")
+    meta_parser.add_argument("exports", nargs="+", help="Scrubbed export JSONL files.")
 
     args = parser.parse_args()
     if args.cmd == "plan":
@@ -153,7 +224,216 @@ def main() -> int:
             output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
             print(f"wrote {output}")
         return 0
+    if args.cmd == "ingest":
+        from tokensmash.ingest import ingest as run_ingest
+
+        roots = {
+            "codex": Path(args.codex_root).expanduser(),
+            "claude-code": Path(args.claude_root).expanduser(),
+        }
+        stats = run_ingest(roots, since_days=args.since_days)
+        print(json.dumps(stats, indent=2, sort_keys=True))
+        return 0
+    if args.cmd == "opportunity":
+        from tokensmash import opportunity as opportunity_mod
+
+        records = load_study_sessions(since_days=args.since_days)
+        print(opportunity_mod.report(records))
+        return 0
+    if args.cmd == "study":
+        if args.study_cmd == "init":
+            from tokensmash.study.assign import init_study
+
+            config = init_study(args.study_id, args.mode, args.protocol_version)
+            print(json.dumps({k: v for k, v in config.items() if k != "seed"}, indent=2, sort_keys=True))
+            print("seed: <kept in config.json, not printed>")
+            return 0
+        if args.study_cmd == "power":
+            from tokensmash.study import power as power_mod
+
+            print(power_mod.report(load_study_sessions()))
+            return 0
+        if args.study_cmd == "export":
+            from tokensmash import schema as schema_mod
+            from tokensmash.store import export_scrubbed
+
+            output = Path(args.output).expanduser()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            count = export_scrubbed(schema_mod.STUDY_DIR / "sessions.jsonl", output)
+            print(f"wrote {count} scrubbed records to {output}")
+            return 0
+        if args.study_cmd == "analyze":
+            from tokensmash.study import analyze as analyze_mod
+            from tokensmash.study.assign import load_study_config
+
+            config = load_study_config()
+            if config is None:
+                print("no study config found; run `tokensmash study init` first")
+                return 3
+            protocol_path = Path(args.protocol).expanduser()
+            if not protocol_path.exists():
+                print(f"protocol file not found: {protocol_path} (pass --protocol)")
+                return 3
+            records = load_study_sessions()
+            try:
+                result = analyze_mod.analyze(records, config, protocol_path.read_text())
+            except analyze_mod.AnalysisRefused as refusal:
+                print(f"analysis refused: {refusal}")
+                return 3
+            print(analyze_mod.report(result))
+            return 0
+        if args.study_cmd == "install":
+            from tokensmash.study.launchctl import install_report
+
+            report_data = install_report(apply=args.apply)
+            print(json.dumps(report_data, indent=2, sort_keys=True))
+            return 0
+        return 2
+    if args.cmd == "replay":
+        from tokensmash import replay as replay_mod
+
+        roots = {
+            "codex": Path(args.codex_root).expanduser(),
+            "claude-code": Path(args.claude_root).expanduser(),
+        }
+        result = replay_mod.replay_corpus(
+            roots, csv_ids(args.tools) or [], limit_sessions=args.limit_sessions, seed=args.seed
+        )
+        print(replay_mod.report(result))
+        return 0
+    if args.cmd == "trajectory":
+        from tokensmash import trajectory as trajectory_mod
+
+        roots = {
+            "codex": Path(args.codex_root).expanduser(),
+            "claude-code": Path(args.claude_root).expanduser(),
+        }
+        result = trajectory_mod.analyze_corpus(roots, limit_sessions=args.limit_sessions, seed=args.seed)
+        print(trajectory_mod.report(result))
+        return 0
+    if args.cmd == "meta":
+        from tokensmash import meta as meta_mod
+
+        records, stats = meta_mod.merge([Path(p).expanduser() for p in args.exports])
+        print(f"merged {len(records)} records (conflicts: {stats['conflicts']}, invalid skipped: {stats['invalid_skipped']})")
+        print()
+        print(meta_mod.report(records))
+        return 0
     return 2
+
+
+def _launch_exec(argv: list[str]) -> int:
+    """Handle `tokensmash launch <agent> [--] [args...]`: resolve and exec.
+
+    Fail-open at every layer: if resolution or the wrapped exec fails, exec
+    the plain agent binary; only a missing binary returns non-zero.
+    """
+    if not argv:
+        sys.stderr.write("usage: tokensmash launch <claude|codex> [--] [args...]\n")
+        return 2
+    agent_cli = argv[0]
+    rest = argv[1:]
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    try:
+        from tokensmash.study.launchctl import resolve_launch
+
+        decision = resolve_launch(agent_cli, rest)
+    except Exception:
+        decision = None
+    if decision and decision.get("exec"):
+        try:
+            os.execvpe(decision["exec"][0], decision["exec"], decision["env"])
+        except OSError:
+            pass  # fall through to plain exec
+    real = shutil.which(agent_cli)
+    if not real:
+        sys.stderr.write(f"tokensmash launch: {agent_cli} not found\n")
+        return 127
+    env = dict(os.environ)
+    env["TOKENSMASH_LAUNCH_ACTIVE"] = "1"
+    os.execvpe(real, [real, *rest], env)
+    return 127  # unreachable
+
+
+def load_study_sessions(since_days: float | None = None) -> list[dict[str, Any]]:
+    from tokensmash import schema as schema_mod
+    from tokensmash.store import load_latest
+
+    # One record per transcript file: subagent transcripts and codex rollouts
+    # share session_id, so reading with the session_id key would silently
+    # collapse them and drop real spend.
+    records = list(
+        load_latest(
+            schema_mod.STUDY_DIR / "sessions.jsonl", key=("agent", "transcript_id")
+        ).values()
+    )
+    if since_days is not None:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
+        records = [
+            record
+            for record in records
+            if record.get("started_at")
+            and dt.datetime.fromisoformat(str(record["started_at"])) >= cutoff
+        ]
+    return records
+
+
+def _study_arm_silent(argv: list[str]) -> int:
+    """Handle `tokensmash study arm [--tool X] [--agent Y] [--log]`.
+
+    Prints the arm for (cwd, now) when a live study exists; otherwise prints
+    nothing. Never raises, never writes stderr, always exits 0.
+    """
+    try:
+        options: dict[str, str] = {}
+        flags: set[str] = set()
+        index = 0
+        while index < len(argv):
+            arg = argv[index]
+            if arg in ("--tool", "--agent") and index + 1 < len(argv):
+                options[arg[2:]] = argv[index + 1]
+                index += 2
+                continue
+            if arg == "--log":
+                flags.add("log")
+            index += 1
+        from tokensmash.study.assign import arm_for_cwd, log_actuation
+
+        resolution = arm_for_cwd(os.getcwd())
+        if resolution is None:
+            return 0
+        if "log" in flags:
+            # Normalize CLI names to agent identifiers so the analyze
+            # coverage join matches session records ("claude" → "claude-code").
+            cli_name = options.get("agent", "")
+            agent_name = {"claude": "claude-code"}.get(cli_name, cli_name)
+            log_actuation(
+                {**resolution, "agent": agent_name},
+                tool=options.get("tool", ""),
+                agent_command=cli_name,
+            )
+        sys.stdout.write(resolution["arm"] + "\n")
+        return 0
+    except Exception:
+        return 0
+
+
+def _study_link_silent(argv: list[str]) -> int:
+    """Handle `tokensmash study link` without argparse, stdout, or stderr."""
+    try:
+        agent = "codex"
+        for index, arg in enumerate(argv):
+            if arg == "--agent" and index + 1 < len(argv):
+                agent = argv[index + 1]
+            elif arg.startswith("--agent="):
+                agent = arg.split("=", 1)[1]
+        stdin_text = sys.stdin.read()
+        from tokensmash.study.link import link_from_hook
+
+        return link_from_hook(stdin_text, agent)
+    except Exception:
+        return 0
 
 
 def load_suite(path: Path) -> dict[str, Any]:
@@ -278,12 +558,61 @@ def suite_effort(suite: dict[str, Any], agent: str) -> str:
     return render_env(str(suite.get("reasoning") or "low"))
 
 
+def _build_position_design(
+    tasks: list[dict[str, Any]],
+    variants: list[dict[str, Any]],
+    replicates: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Build a balanced position design matrix (Latin-square where possible).
+
+    Each variant occupies each within-task position slot equally often across
+    (task × replicate) blocks.  For V variants and T*R slots (T tasks,
+    R replicates per task), when (T*R) % V == 0 we use a pure Latin-square
+    rotation; otherwise we rotate as completely as possible and append
+    a random completion for the remainder.
+
+    Returns a list of dicts {task_id, variant_id, replicate, position} ordered
+    by position within each task.
+    """
+    rng = random.Random(seed)
+    V = len(variants)
+    if V == 0:
+        return []
+    # Randomize which variant leads the rotation so repeated suites with
+    # different seeds don't always give task 0 the same leader.
+    base = rng.randrange(V)
+    design: list[dict[str, Any]] = []
+    for task_index, task in enumerate(tasks):
+        for replicate in range(1, replicates + 1):
+            slot_variants = list(variants)
+            # Rotate by the global slot number (task-major), so position
+            # balance holds across TASKS as well as replicates. Rotating by
+            # replicate alone would give every task an identical variant
+            # order when replicates=1 — precisely the cold-cache position
+            # confound this design exists to remove.
+            slot = task_index * replicates + (replicate - 1)
+            offset = (base + slot) % V
+            slot_variants = slot_variants[offset:] + slot_variants[:offset]
+            for position, variant in enumerate(slot_variants, start=1):
+                design.append(
+                    {
+                        "task_id": task["id"],
+                        "variant_id": variant["id"],
+                        "replicate": replicate,
+                        "position": position,
+                    }
+                )
+    return design
+
+
 def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.Namespace) -> Path:
     run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = AB_RUNS_DIR / run_id
     require(not run_dir.exists(), f"run dir already exists: {run_dir}")
     run_dir.mkdir(parents=True)
     agent = suite_agent(suite)
+    baseline_replicates = int(getattr(args, "baseline_replicates", 1) or 1)
     results: dict[str, Any] = {
         "schema": 1,
         "kind": "tokensmash-ab",
@@ -295,27 +624,68 @@ def run_suite(suite: dict[str, Any], selection: dict[str, Any], args: argparse.N
         "model": suite_model(suite, agent),
         "reasoning": suite_effort(suite, agent),
         "replicates": selection["replicates"],
+        "baseline_replicates": baseline_replicates,
         "runs": [],
         "notes": [
             "primary metric is provider-reported total session tokens when available",
             "only paired successful task runs are used for improvement percentages",
             "raw agent stdout/stderr and last message are stored in the run directory for debugging",
         ],
+        "code_version": _code_version_stamp(),
     }
     results["host_fingerprint_before"] = host_fingerprint()
     (run_dir / "suite.json").write_text(json.dumps(scrub_suite(suite), indent=2, sort_keys=True) + "\n")
+
+    # Build the run list, optionally with baseline extra replicates
     cases: list[tuple[dict[str, Any], dict[str, Any], int]] = []
+    baseline_id = str(suite["baseline"])
     for task in selection["tasks"]:
         for variant in selection["variants"]:
-            for replicate in range(1, selection["replicates"] + 1):
+            rep_count = (
+                baseline_replicates
+                if str(variant["id"]) == baseline_id
+                else selection["replicates"]
+            )
+            for replicate in range(1, rep_count + 1):
                 cases.append((task, variant, replicate))
-    if getattr(args, "randomize_order", False):
+
+    balance_positions = getattr(args, "balance_positions", False)
+    if balance_positions:
+        # Build position design and reorder cases accordingly
+        position_design = _build_position_design(
+            selection["tasks"],
+            selection["variants"],
+            selection["replicates"],
+            int(getattr(args, "seed", 0) or 0),
+        )
+        results["position_design"] = position_design
+        # Re-order cases to match the balanced design for non-baseline variants;
+        # baseline extra-replicates are appended after.
+        design_order: list[tuple[dict[str, Any], dict[str, Any], int]] = []
+        task_map = {t["id"]: t for t in selection["tasks"]}
+        variant_map = {str(v["id"]): v for v in selection["variants"]}
+        for entry in position_design:
+            t = task_map.get(entry["task_id"])
+            v = variant_map.get(str(entry["variant_id"]))
+            if t and v:
+                design_order.append((t, v, entry["replicate"]))
+        # Append any baseline extra replicates that aren't in the standard design
+        standard_replicate_count = selection["replicates"]
+        for task in selection["tasks"]:
+            for replicate in range(standard_replicate_count + 1, baseline_replicates + 1):
+                v = variant_map.get(baseline_id)
+                if v:
+                    design_order.append((task, v, replicate))
+        cases = design_order
+        results["randomized_order"] = False
+    elif getattr(args, "randomize_order", False):
         rng = random.Random(int(getattr(args, "seed", 0) or 0))
         rng.shuffle(cases)
         results["randomized_order"] = True
         results["random_seed"] = int(getattr(args, "seed", 0) or 0)
     else:
         results["randomized_order"] = False
+
     try:
         for run_order, (task, variant, replicate) in enumerate(cases, start=1):
             status, why = variant_status(suite, variant)
@@ -2300,6 +2670,33 @@ def read_head(path: Path, size: int = 12000) -> str:
         return handle.read(size).decode("utf-8", "replace")
 
 
+def _git_describe() -> str | None:
+    """Return `git describe --always --dirty` output, or None if git is unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "describe", "--always", "--dirty"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _code_version_stamp() -> dict[str, Any]:
+    from tokensmash import __version__ as _pkg_version  # noqa: PLC0415
+
+    return {
+        "bench_audit_version": BENCH_AUDIT_VERSION,
+        "git": _git_describe(),
+        "package": _pkg_version,
+    }
+
+
 def write_results(run_dir: Path, results: dict[str, Any]) -> None:
     (run_dir / "results.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
 
@@ -2343,6 +2740,13 @@ def audit_suite_methodology(results: dict[str, Any]) -> dict[str, Any]:
     after = results.get("host_fingerprint_after")
     add("host fingerprint captured", isinstance(before, dict) and isinstance(after, dict))
     add("host config unchanged", before == after)
+    randomized = results.get("randomized_order") is True
+    balanced = "position_design" in results
+    add(
+        "positions balanced or randomized",
+        randomized or balanced,
+        "use --balance-positions or --randomize-order to satisfy this check",
+    )
     add("randomized order recorded", "randomized_order" in results)
     run_orders = [run.get("run_order") for run in results.get("runs", []) if run.get("status") != "skipped"]
     add("run order complete", sorted(run_orders) == list(range(1, len(run_orders) + 1)))
@@ -2393,6 +2797,16 @@ def print_table(results: dict[str, Any]) -> None:
 
 
 def print_aggregate_table(results_list: list[dict[str, Any]], strict: bool = False) -> None:
+    if strict:
+        offending = _strict_version_check(results_list)
+        if offending:
+            msg = (
+                f"aggregate --strict: {len(offending)} result file(s) lack "
+                f"bench_audit_version=={BENCH_AUDIT_VERSION} and are excluded:\n"
+                + "\n".join(f"  {p}" for p in offending)
+            )
+            print(msg, file=sys.stderr)
+            sys.exit(1)
     headers = [
         "tool",
         "pairs",
@@ -2406,6 +2820,7 @@ def print_aggregate_table(results_list: list[dict[str, Any]], strict: bool = Fal
         "tool cost",
         "cost improvement",
         "cost 95% ci",
+        "baseline sd",
         "positive non-cached",
         "mechanism",
         "methodology",
@@ -2418,80 +2833,144 @@ def print_aggregate_table(results_list: list[dict[str, Any]], strict: bool = Fal
         print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
 
 
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    m = _mean(values)
+    variance = sum((v - m) ** 2 for v in values) / (len(values) - 1)
+    return variance ** 0.5
+
+
+def _strict_version_check(results_list: list[dict[str, Any]]) -> list[str]:
+    """Return list of offending file paths that lack bench_audit_version == BENCH_AUDIT_VERSION."""
+    bad: list[str] = []
+    for results in results_list:
+        cv = results.get("code_version")
+        bav = cv.get("bench_audit_version") if isinstance(cv, dict) else None
+        if bav != BENCH_AUDIT_VERSION:
+            bad.append(results.get("_path", "<unknown>"))
+    return bad
+
+
 def aggregate_rows(results_list: list[dict[str, Any]], strict: bool = False) -> list[list[str]]:
     aggregate: dict[str, dict[str, Any]] = {}
     for results in results_list:
         suite_ok = suite_methodology_passed(results)
         baseline_id = str(results["baseline"])
-        grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+
+        # Group successful runs by (task_id, replicate) -> variant_id -> run
+        grouped: dict[tuple[str, int], dict[str, list[dict[str, Any]]]] = {}
         for run in results.get("runs", []):
             if not run.get("success"):
                 continue
             key = (str(run.get("task_id")), int(run.get("replicate") or 1))
-            grouped.setdefault(key, {})[str(run.get("variant_id"))] = run
-        for by_variant in grouped.values():
-            baseline = by_variant.get(baseline_id)
-            if not baseline:
+            vid = str(run.get("variant_id"))
+            grouped.setdefault(key, {}).setdefault(vid, []).append(run)
+
+        # Build a task-level baseline mean when baseline_replicates > 1.
+        # Key: task_id -> {mean_tokens, mean_non_cached, mean_cost, sd_tokens, runs}
+        task_baseline: dict[str, dict[str, Any]] = {}
+        for (task_id, replicate), by_variant in grouped.items():
+            baseline_runs = by_variant.get(baseline_id, [])
+            for b_run in baseline_runs:
+                tb = task_baseline.setdefault(task_id, {"token_totals": [], "non_cached": [], "costs": []})
+                bt = b_run.get("token_total")
+                bnc = run_non_cached_tokens(b_run)
+                bc = run_api_cost(b_run)
+                if bt is not None:
+                    tb["token_totals"].append(float(bt))
+                if bnc is not None:
+                    tb["non_cached"].append(float(bnc))
+                if bc is not None:
+                    tb["costs"].append(bc)
+
+        # Now pair each tool run against the mean baseline for its task
+        for (task_id, replicate), by_variant in grouped.items():
+            tb = task_baseline.get(task_id)
+            if not tb or not tb["token_totals"]:
                 continue
-            base_tokens = baseline.get("token_total")
-            base_non_cached = run_non_cached_tokens(baseline)
-            if base_tokens is None or base_non_cached is None:
+            base_tokens_mean = _mean(tb["token_totals"])
+            base_non_cached_mean = _mean(tb["non_cached"]) if tb["non_cached"] else None
+            base_cost_mean = _mean(tb["costs"]) if tb["costs"] else None
+            base_tokens_sd = _stddev(tb["token_totals"])
+
+            if base_non_cached_mean is None or base_cost_mean is None:
                 continue
-            for variant_id, tool in by_variant.items():
+
+            # For backward compat, also try a single baseline run from this replicate key
+            # if no task-level multi-replicate data: fall back to single run
+            replicate_baseline_runs = by_variant.get(baseline_id, [])
+
+            for variant_id, tool_runs in by_variant.items():
                 if variant_id == baseline_id:
                     continue
-                bucket = aggregate.setdefault(
-                    variant_id,
-                    {
-                        "pairs": 0,
-                        "invalid": 0,
-                        "base_total": 0,
-                        "tool_total": 0,
-                        "base_non_cached": 0,
-                        "tool_non_cached": 0,
-                        "base_cost": 0.0,
-                        "tool_cost": 0.0,
-                        "positive_non_cached": 0,
-                        "cost_improvements": [],
-                        "methodology_excluded": 0,
-                    },
-                )
-                if not mechanism_observed(tool, baseline_id):
-                    bucket["invalid"] += 1
-                    continue
-                if strict and not (suite_ok and methodology_passed(baseline) and methodology_passed(tool)):
-                    bucket["methodology_excluded"] += 1
-                    continue
-                tool_tokens = tool.get("token_total")
-                tool_non_cached = run_non_cached_tokens(tool)
-                if tool_tokens is None or tool_non_cached is None:
-                    bucket["invalid"] += 1
-                    continue
-                base_cost = run_api_cost(baseline)
-                tool_cost = run_api_cost(tool)
-                if base_cost is None or tool_cost is None:
-                    bucket["invalid"] += 1
-                    continue
-                bucket["pairs"] += 1
-                bucket["base_total"] += int(base_tokens)
-                bucket["tool_total"] += int(tool_tokens)
-                bucket["base_non_cached"] += int(base_non_cached)
-                bucket["tool_non_cached"] += int(tool_non_cached)
-                bucket["base_cost"] += base_cost
-                bucket["tool_cost"] += tool_cost
-                bucket["cost_improvements"].append((base_cost - tool_cost) / base_cost * 100 if base_cost else 0.0)
-                if tool_non_cached < base_non_cached:
-                    bucket["positive_non_cached"] += 1
+                for tool in tool_runs:
+                    bucket = aggregate.setdefault(
+                        variant_id,
+                        {
+                            "pairs": 0,
+                            "invalid": 0,
+                            "base_total": 0.0,
+                            "tool_total": 0,
+                            "base_non_cached": 0.0,
+                            "tool_non_cached": 0,
+                            "base_cost": 0.0,
+                            "tool_cost": 0.0,
+                            "positive_non_cached": 0,
+                            "cost_improvements": [],
+                            "methodology_excluded": 0,
+                            "base_token_sds": [],
+                        },
+                    )
+                    if not mechanism_observed(tool, baseline_id):
+                        bucket["invalid"] += 1
+                        continue
+                    # For strict methodology, check a representative baseline run
+                    if strict:
+                        rep_baseline = replicate_baseline_runs[0] if replicate_baseline_runs else None
+                        if not (suite_ok and (rep_baseline is None or methodology_passed(rep_baseline)) and methodology_passed(tool)):
+                            bucket["methodology_excluded"] += 1
+                            continue
+                    tool_tokens = tool.get("token_total")
+                    tool_non_cached = run_non_cached_tokens(tool)
+                    if tool_tokens is None or tool_non_cached is None:
+                        bucket["invalid"] += 1
+                        continue
+                    tool_cost = run_api_cost(tool)
+                    if tool_cost is None:
+                        bucket["invalid"] += 1
+                        continue
+                    bucket["pairs"] += 1
+                    bucket["base_total"] += base_tokens_mean
+                    bucket["tool_total"] += int(tool_tokens)
+                    bucket["base_non_cached"] += base_non_cached_mean
+                    bucket["tool_non_cached"] += int(tool_non_cached)
+                    bucket["base_cost"] += base_cost_mean
+                    bucket["tool_cost"] += tool_cost
+                    bucket["cost_improvements"].append(
+                        (base_cost_mean - tool_cost) / base_cost_mean * 100 if base_cost_mean else 0.0
+                    )
+                    if int(tool_non_cached) < base_non_cached_mean:
+                        bucket["positive_non_cached"] += 1
+                    bucket["base_token_sds"].append(base_tokens_sd)
 
     rows: list[list[str]] = []
     for variant_id, bucket in sorted(aggregate.items()):
         pairs = int(bucket["pairs"])
         invalid = int(bucket["invalid"])
+        # Compute mean baseline SD across all pairs
+        sds = bucket.get("base_token_sds", [])
+        baseline_sd_cell = format_int_cell(int(_mean(sds))) if sds else "n/a"
         if pairs == 0:
             rows.append(
                 [
                     variant_id,
                     "0",
+                    "n/a",
                     "n/a",
                     "n/a",
                     "n/a",
@@ -2513,22 +2992,23 @@ def aggregate_rows(results_list: list[dict[str, Any]], strict: bool = False) -> 
             [
                 variant_id,
                 str(pairs),
-                format_int_cell(bucket["base_total"]),
+                format_int_cell(int(bucket["base_total"])),
                 format_int_cell(bucket["tool_total"]),
                 pct_improvement(bucket["base_total"], bucket["tool_total"]),
-                format_int_cell(bucket["base_non_cached"]),
+                format_int_cell(int(bucket["base_non_cached"])),
                 format_int_cell(bucket["tool_non_cached"]),
                 pct_improvement(bucket["base_non_cached"], bucket["tool_non_cached"]),
                 format_cost_cell(bucket["base_cost"]),
                 format_cost_cell(bucket["tool_cost"]),
                 pct_improvement_float(bucket["base_cost"], bucket["tool_cost"]),
                 ci_cell(bucket["cost_improvements"]),
+                baseline_sd_cell,
                 f"{bucket['positive_non_cached']}/{pairs}",
                 mechanism,
                 aggregate_methodology_cell(bucket),
             ]
         )
-    return rows or [["no comparable tool rows", "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "n/a", "n/a"]]
+    return rows or [["no comparable tool rows", "0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0/0", "n/a", "n/a"]]
 
 
 def comparison_rows(results: dict[str, Any], baseline_id: str) -> list[list[str]]:
@@ -2987,8 +3467,8 @@ def format_cost_cell(value: float | None) -> str:
 def ci_cell(values: list[float]) -> str:
     if not values:
         return "n/a"
-    if len(values) == 1:
-        return f"{values[0]:+.1f}%"
+    if len(values) < 10:
+        return "pilot (n<10)"
     samples = bootstrap_means(values, iterations=2000, seed=17)
     lower = percentile(samples, 2.5)
     upper = percentile(samples, 97.5)

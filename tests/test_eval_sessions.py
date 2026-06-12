@@ -222,8 +222,8 @@ class EvalSessionsTest(unittest.TestCase):
         self.assertEqual(rows[0][5], "1,300")
         self.assertEqual(rows[0][6], "1,450")
         self.assertEqual(rows[0][7], "-11.5%")
-        self.assertEqual(rows[0][12], "1/2")
-        self.assertEqual(rows[0][14], "pass")
+        self.assertEqual(rows[0][13], "1/2")  # positive non-cached (shifted by new baseline sd col at [12])
+        self.assertEqual(rows[0][15], "pass")  # methodology (shifted by new baseline sd col at [12])
 
     def test_isolated_codex_home_sets_home_under_case_dir(self) -> None:
         with TemporaryDirectory() as tmp:
